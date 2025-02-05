@@ -5,6 +5,15 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "type": "cppvsdbg",
+            "name": "Launch",
+            "preLaunchTask": "rust: cargo build",
+            "program": "${workspaceRoot}/target/debug/rpgs_studio.exe",
+            "request": "launch",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceRoot}"
+        },
+        {
             "type": "lldb",
             "request": "launch",
             "name": "Debug executable 'rps-studio'",

@@ -1,7 +1,12 @@
-use std::{fs::File, sync::Arc};
+use std::{ffi::c_void, fmt::Debug, fs::File, path::PathBuf, sync::Arc};
 
 use app_dirs2::AppInfo;
 
+use ash::vk::{
+    Bool32, DebugUtilsMessageSeverityFlagsEXT, DebugUtilsMessageTypeFlagsEXT,
+    DebugUtilsMessengerCallbackDataEXT, DebugUtilsMessengerEXT,
+};
+use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use winit::{application::ApplicationHandler, event::WindowEvent, event_loop, window::Window};
 
@@ -12,9 +17,11 @@ const APP_INFO: AppInfo = AppInfo {
 
 struct RunningState {
     win: Arc<Window>,
+    instance: Arc<Instance>,
 }
 struct SuspendedState {
     win: Arc<Window>,
+    instance: Arc<Instance>,
 }
 struct UninitState {
     #[expect(dead_code)]
@@ -123,7 +130,7 @@ impl AppRunner {
 
 impl ApplicationHandler for AppRunner {
     fn resumed(&mut self, event_loop: &event_loop::ActiveEventLoop) {
-        if let Some(_us) = self.take_uninit() {
+        if let Some(UninitState { instance }) = self.take_uninit() {
             let win_attributes = Window::default_attributes().with_resizable(false);
             let win = Arc::new(match event_loop.create_window(win_attributes) {
                 Ok(win) => win,
@@ -134,18 +141,18 @@ impl ApplicationHandler for AppRunner {
                 }
             });
 
-            self.app_state = Some(AppState::Running(RunningState { win }))
+            self.app_state = Some(AppState::Running(RunningState { win, instance }))
         }
-        if let Some(ss) = self.take_suspended() {
-            self.app_state = Some(AppState::Running(RunningState { win: ss.win }));
+        if let Some(SuspendedState { win, instance }) = self.take_suspended() {
+            self.app_state = Some(AppState::Running(RunningState { win, instance }));
         }
 
         event_loop.set_control_flow(event_loop::ControlFlow::Poll);
     }
 
     fn suspended(&mut self, event_loop: &event_loop::ActiveEventLoop) {
-        if let Some(rs) = self.take_running() {
-            self.app_state = Some(AppState::Suspended(SuspendedState { win: rs.win }))
+        if let Some(RunningState { instance, win }) = self.take_running() {
+            self.app_state = Some(AppState::Suspended(SuspendedState { win, instance }))
         }
 
         event_loop.set_control_flow(event_loop::ControlFlow::Wait);
@@ -156,7 +163,7 @@ impl ApplicationHandler for AppRunner {
         window_id: winit::window::WindowId,
         event: winit::event::WindowEvent,
     ) {
-        if let Some(RunningState { win }) = self.as_running_mut() {
+        if let Some(RunningState { win, instance }) = self.as_running_mut() {
             match event {
                 WindowEvent::CloseRequested if window_id == win.id() => {
                     self.app_state = Some(AppState::Exiting);
@@ -168,13 +175,22 @@ impl ApplicationHandler for AppRunner {
     }
 }
 
+#[derive(clap::Parser, Debug)]
+struct Args {
+    //TODO: Configure default to change based on build personality (e.g. release vs internal opt vs debug)
+    #[arg(short, long, default_value_t = VulkanDebugLevel::Warn)]
+    vulkan_debug_level: VulkanDebugLevel,
+    #[arg(short, long, default_value_t=tracing::Level::WARN)]
+    log_level: tracing::Level,
+}
+
 fn main() -> eyre::Result<()> {
+    let args = Args::parse();
     println!("Hello, world!");
 
     let app_data_dir = app_dirs2::app_root(app_dirs2::AppDataType::UserData, &APP_INFO)?;
 
-    let mut log_target_file = app_data_dir.clone();
-    log_target_file.push("LOG.txt");
+    let log_target_file: PathBuf = [app_data_dir.clone(), "LOG.txt".into()].iter().collect();
 
     eprintln!(
         "Logging at {}",
@@ -200,12 +216,15 @@ fn main() -> eyre::Result<()> {
     tracing_subscriber::registry()
         .with(main_layer)
         .with(file_layer)
-        .with(tracing_subscriber::filter::LevelFilter::DEBUG)
+        .with(tracing_subscriber::filter::LevelFilter::from_level(
+            args.log_level,
+        ))
         .init();
 
-    tracing::error!("Test");
-
-    let instance = Arc::new(Instance::new(Version::new(1, 3, 0))?);
+    let instance = Arc::new(Instance::new(
+        Version::new(1, 3, 0),
+        args.vulkan_debug_level,
+    )?);
 
     let event_loop = winit::event_loop::EventLoop::builder().build()?;
     let mut app = AppRunner::new(UninitState { instance });
@@ -213,9 +232,74 @@ fn main() -> eyre::Result<()> {
     Ok(())
 }
 
+struct DebugMessenger {
+    debug_messenger: DebugUtilsMessengerEXT,
+    debug_utils_instance: ash::ext::debug_utils::Instance,
+}
+
+#[derive(
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    strum_macros::EnumString,
+    strum_macros::Display,
+    Clone,
+    Copy,
+)]
+enum VulkanDebugLevel {
+    #[default]
+    None,
+    Verbose,
+    Info,
+    Warn,
+    Error,
+}
+impl VulkanDebugLevel {
+    fn sev_flags(&self) -> DebugUtilsMessageSeverityFlagsEXT {
+        match self {
+            VulkanDebugLevel::None => DebugUtilsMessageSeverityFlagsEXT::empty(),
+            VulkanDebugLevel::Verbose => {
+                DebugUtilsMessageSeverityFlagsEXT::VERBOSE | Self::Info.sev_flags()
+            }
+            VulkanDebugLevel::Info => {
+                DebugUtilsMessageSeverityFlagsEXT::INFO | Self::Warn.sev_flags()
+            }
+            VulkanDebugLevel::Warn => {
+                DebugUtilsMessageSeverityFlagsEXT::WARNING | Self::Error.sev_flags()
+            }
+            VulkanDebugLevel::Error => DebugUtilsMessageSeverityFlagsEXT::ERROR,
+        }
+    }
+}
+
 struct Instance {
     _entry: ash::Entry,
     instance: ash::Instance,
+    debug_messenger: Option<DebugMessenger>,
+}
+impl Drop for Instance {
+    fn drop(&mut self) {
+        if let Some(dm) = self.debug_messenger.take() {
+            //SAFETY: Last usage of debug_messenger. This deinitializes it.
+            unsafe {
+                dm.debug_utils_instance
+                    .destroy_debug_utils_messenger(dm.debug_messenger, None)
+            };
+        };
+        //SAFETY: Last use of Instance, all children destroyed
+        unsafe { self.destroy_instance(None) };
+    }
+}
+impl Debug for Instance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Instance")
+            .field("entry", &"{entry}")
+            .field("instance", &self.instance.handle())
+            .finish()
+    }
 }
 
 impl std::ops::Deref for Instance {
@@ -274,7 +358,10 @@ impl From<ash::vk::Result> for InstanceCreateError {
 }
 
 impl Instance {
-    fn new(minimum_vk_version: Version) -> Result<Self, InstanceCreateError> {
+    fn new(
+        minimum_vk_version: Version,
+        debug_level: VulkanDebugLevel,
+    ) -> Result<Self, InstanceCreateError> {
         //SAFETY: Somewhat inherently unsafe due to loading a shared library which can run arbitrary initialization code. However, we are probably fine since
         let entry = unsafe { ash::Entry::load() }.map_err(InstanceCreateError::EntryLoading)?;
 
@@ -283,21 +370,126 @@ impl Instance {
             .api_version(minimum_vk_version.to_vk_version())
             .engine_name(c"RPS Studio");
 
-        let enabled_extension_names = Vec::with_capacity(8);
-        let enabled_layer_names = Vec::with_capacity(1);
+        //SAFETY: Basically always safe
+        let available_extensions_vec =
+            unsafe { entry.enumerate_instance_extension_properties(None) }
+                .expect("Couldn't fetch extensions");
+        let available_extensions = available_extensions_vec.iter().map(|ext| {
+            ext.extension_name_as_c_str()
+                .expect("Vulkan extensions should be able to be converted to C Strings")
+        });
+        //SAFETY: Basically always safe
+        let available_layers_vec = unsafe { entry.enumerate_instance_layer_properties() }
+            .expect("Couldn't fetch extensions");
+        let available_layers = available_layers_vec.iter().map(|layer| {
+            layer
+                .layer_name_as_c_str()
+                .expect("Vulkan layers should be abe to be converted to C Strings")
+        });
 
-        let ci = ash::vk::InstanceCreateInfo::default()
+        const VK_KHRONOS_VALIDATION: &std::ffi::CStr = c"VK_LAYER_KHRONOS_validation";
+        let mut enabled_extension_names = Vec::with_capacity(8);
+        let mut enabled_layer_names = Vec::with_capacity(1);
+        let debug_enabled = debug_level != VulkanDebugLevel::None
+            && available_extensions
+                .clone()
+                .any(|ext| ext.eq(ash::ext::debug_utils::NAME))
+            && available_layers
+                .clone()
+                .any(|ext| ext.eq(VK_KHRONOS_VALIDATION));
+
+        let mut debug_ci = debug_enabled.then(|| {
+            enabled_extension_names.push(ash::ext::debug_utils::NAME.as_ptr());
+            enabled_layer_names.push(VK_KHRONOS_VALIDATION.as_ptr());
+            ash::vk::DebugUtilsMessengerCreateInfoEXT::default()
+                .message_severity(debug_level.sev_flags())
+                .message_type(
+                    DebugUtilsMessageTypeFlagsEXT::DEVICE_ADDRESS_BINDING
+                        | DebugUtilsMessageTypeFlagsEXT::GENERAL
+                        | DebugUtilsMessageTypeFlagsEXT::PERFORMANCE
+                        | DebugUtilsMessageTypeFlagsEXT::VALIDATION,
+                )
+                .pfn_user_callback(Some(instance_debug_callback))
+        });
+        let mut ci = ash::vk::InstanceCreateInfo::default()
             .application_info(&app_info)
             .enabled_extension_names(&enabled_extension_names)
             .enabled_layer_names(&enabled_layer_names);
+
+        if let Some(dci) = debug_ci.as_mut() {
+            ci = ci.push_next(dci)
+        }
 
         //SAFETY: Valid InstanceCI being used, Instance is destroyed before
         //entry
         let instance = unsafe { entry.create_instance(&ci, None) }?;
 
+        let debug_messenger = if debug_enabled {
+            let debug_utils_instance = ash::ext::debug_utils::Instance::new(&entry, &instance);
+            //SAFETY: We follow all of vulkan's rules
+            let debug_messenger = unsafe {
+                debug_utils_instance.create_debug_utils_messenger(
+                    debug_ci
+                        .as_ref()
+                        .expect("If debug_enabled is true, we always fill out the ci"),
+                    None,
+                )
+            }
+            .expect("How did we fail to build the debug messenger?");
+            Some(DebugMessenger {
+                debug_messenger,
+                debug_utils_instance,
+            })
+        } else {
+            None
+        };
+
         Ok(Self {
             _entry: entry,
             instance,
+            debug_messenger,
         })
     }
+}
+
+unsafe extern "system" fn instance_debug_callback(
+    message_severity: DebugUtilsMessageSeverityFlagsEXT,
+    message_types: DebugUtilsMessageTypeFlagsEXT,
+    p_callback_data: *const DebugUtilsMessengerCallbackDataEXT<'_>,
+    _: *mut c_void,
+) -> Bool32 {
+    //SAFETY: Vulkan has to give us a valid callback data
+    let callback_data = unsafe { *p_callback_data };
+
+    let msg_id = callback_data.message_id_number;
+    //SAFETY: Vulkan must give us a valid message name
+    let msg_name = unsafe { callback_data.message_id_name_as_c_str() };
+    //SAFETY: Vulkan must give us a valid message
+    let msg_data = unsafe { callback_data.message_as_c_str() };
+    use DebugUtilsMessageSeverityFlagsEXT as SevFlags;
+    use DebugUtilsMessageTypeFlagsEXT as TyFlags;
+    let mut ty_name = String::with_capacity(16);
+    if message_types.contains(TyFlags::DEVICE_ADDRESS_BINDING) {
+        ty_name.push_str("ADDRESS BINDING");
+    }
+    if message_types.contains(TyFlags::GENERAL) {
+        ty_name.push_str("GENERAL");
+    }
+    if message_types.contains(TyFlags::PERFORMANCE) {
+        ty_name.push_str("PERF");
+    }
+    if message_types.contains(TyFlags::VALIDATION) {
+        ty_name.push_str("VALIDATION");
+    }
+    if message_severity.contains(SevFlags::ERROR) {
+        tracing::error!("{ty_name}: {msg_id} {msg_name:?}: {msg_data:?}");
+    } else if message_severity.contains(SevFlags::WARNING) {
+        tracing::warn!("{ty_name}: {msg_id} {msg_name:?}: {msg_data:?}")
+    } else if message_severity.contains(SevFlags::INFO) {
+        tracing::info!("{ty_name}: {msg_id} {msg_name:?}: {msg_data:?}")
+    } else if message_severity.contains(SevFlags::VERBOSE) {
+        tracing::trace!("{ty_name}: {msg_id} {msg_name:?}: {msg_data:?}")
+    }
+
+    ash::vk::FALSE
 }

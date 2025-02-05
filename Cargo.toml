@@ -6,7 +6,10 @@ edition = "2021"
 [dependencies]
 app_dirs2 = "2.5.5"
 ash = "0.38.0"
+clap = { version = "4.5.28", features = ["derive"] }
 eyre = "0.6.12"
+strum = "0.26.3"
+strum_macros = "0.26.4"
 thiserror = "2.0.3"
 tracing = "0.1.40"
 tracing-appender = "0.2.3"
