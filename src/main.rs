@@ -1,14 +1,27 @@
-use std::{ffi::c_void, fmt::Debug, fs::File, path::PathBuf, sync::Arc};
+use std::{
+    ffi::{c_void, CStr},
+    fmt::Debug,
+    fs::File,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use app_dirs2::AppInfo;
 
 use ash::vk::{
     Bool32, DebugUtilsMessageSeverityFlagsEXT, DebugUtilsMessageTypeFlagsEXT,
-    DebugUtilsMessengerCallbackDataEXT, DebugUtilsMessengerEXT,
+    DebugUtilsMessengerCallbackDataEXT, DebugUtilsMessengerEXT, SurfaceKHR,
 };
 use clap::Parser;
+use thiserror::Error;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use winit::{application::ApplicationHandler, event::WindowEvent, event_loop, window::Window};
+use winit::{
+    application::ApplicationHandler,
+    event::WindowEvent,
+    event_loop,
+    raw_window_handle::{DisplayHandle, HasDisplayHandle, HasWindowHandle},
+    window::Window,
+};
 
 const APP_INFO: AppInfo = AppInfo {
     name: "rps-studio",
@@ -18,13 +31,13 @@ const APP_INFO: AppInfo = AppInfo {
 struct RunningState {
     win: Arc<Window>,
     instance: Arc<Instance>,
+    _surface: Arc<Surface>,
 }
 struct SuspendedState {
     win: Arc<Window>,
     instance: Arc<Instance>,
 }
 struct UninitState {
-    #[expect(dead_code)]
     instance: Arc<Instance>,
 }
 
@@ -141,17 +154,47 @@ impl ApplicationHandler for AppRunner {
                 }
             });
 
-            self.app_state = Some(AppState::Running(RunningState { win, instance }))
+            let surface = match Surface::from_winit_window(&win, &instance) {
+                Ok(s) => Arc::new(s),
+                Err(e) => {
+                    tracing::error!("Could not create surface: Error {}", e);
+                    event_loop.exit();
+                    return;
+                }
+            };
+
+            self.app_state = Some(AppState::Running(RunningState {
+                win,
+                instance,
+                _surface: surface,
+            }))
         }
         if let Some(SuspendedState { win, instance }) = self.take_suspended() {
-            self.app_state = Some(AppState::Running(RunningState { win, instance }));
+            let surface = match Surface::from_winit_window(&win, &instance) {
+                Ok(s) => Arc::new(s),
+                Err(e) => {
+                    tracing::error!("Could not recreate surface: Error {}", e);
+                    event_loop.exit();
+                    return;
+                }
+            };
+            self.app_state = Some(AppState::Running(RunningState {
+                win,
+                instance,
+                _surface: surface,
+            }));
         }
 
         event_loop.set_control_flow(event_loop::ControlFlow::Poll);
     }
 
     fn suspended(&mut self, event_loop: &event_loop::ActiveEventLoop) {
-        if let Some(RunningState { instance, win }) = self.take_running() {
+        if let Some(RunningState {
+            instance,
+            win,
+            _surface: _,
+        }) = self.take_running()
+        {
             self.app_state = Some(AppState::Suspended(SuspendedState { win, instance }))
         }
 
@@ -163,7 +206,12 @@ impl ApplicationHandler for AppRunner {
         window_id: winit::window::WindowId,
         event: winit::event::WindowEvent,
     ) {
-        if let Some(RunningState { win, instance }) = self.as_running_mut() {
+        if let Some(RunningState {
+            win,
+            instance: _,
+            _surface: _,
+        }) = self.as_running_mut()
+        {
             match event {
                 WindowEvent::CloseRequested if window_id == win.id() => {
                     self.app_state = Some(AppState::Exiting);
@@ -221,12 +269,15 @@ fn main() -> eyre::Result<()> {
         ))
         .init();
 
+    let event_loop = winit::event_loop::EventLoop::builder().build()?;
     let instance = Arc::new(Instance::new(
         Version::new(1, 3, 0),
         args.vulkan_debug_level,
+        event_loop
+            .display_handle()
+            .expect("Couldn't get display handle"),
     )?);
 
-    let event_loop = winit::event_loop::EventLoop::builder().build()?;
     let mut app = AppRunner::new(UninitState { instance });
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -276,7 +327,7 @@ impl VulkanDebugLevel {
 }
 
 struct Instance {
-    _entry: ash::Entry,
+    entry: ash::Entry,
     instance: ash::Instance,
     debug_messenger: Option<DebugMessenger>,
 }
@@ -316,6 +367,8 @@ enum InstanceCreateError {
     UnspecifiedVulkan(ash::vk::Result),
     #[error("Error loading vulkan: {0}")]
     EntryLoading(ash::LoadingError),
+    #[error("Missing necessary window extensions")]
+    MissingWindowingExtensions,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -361,9 +414,11 @@ impl Instance {
     fn new(
         minimum_vk_version: Version,
         debug_level: VulkanDebugLevel,
+        display_handle: DisplayHandle,
     ) -> Result<Self, InstanceCreateError> {
+        use InstanceCreateError as Error;
         //SAFETY: Somewhat inherently unsafe due to loading a shared library which can run arbitrary initialization code. However, we are probably fine since
-        let entry = unsafe { ash::Entry::load() }.map_err(InstanceCreateError::EntryLoading)?;
+        let entry = unsafe { ash::Entry::load() }.map_err(Error::EntryLoading)?;
 
         //TODO: Engine version, app name, app version
         let app_info = ash::vk::ApplicationInfo::default()
@@ -374,6 +429,7 @@ impl Instance {
         let available_extensions_vec =
             unsafe { entry.enumerate_instance_extension_properties(None) }
                 .expect("Couldn't fetch extensions");
+
         let available_extensions = available_extensions_vec.iter().map(|ext| {
             ext.extension_name_as_c_str()
                 .expect("Vulkan extensions should be able to be converted to C Strings")
@@ -381,15 +437,33 @@ impl Instance {
         //SAFETY: Basically always safe
         let available_layers_vec = unsafe { entry.enumerate_instance_layer_properties() }
             .expect("Couldn't fetch extensions");
+
         let available_layers = available_layers_vec.iter().map(|layer| {
             layer
                 .layer_name_as_c_str()
                 .expect("Vulkan layers should be abe to be converted to C Strings")
         });
 
+        let window_system_exts = ash_window::enumerate_required_extensions(display_handle.as_raw())
+            .expect("Unable to get needed window system extensions from the Display Handle?");
+
+        if !window_system_exts
+            .iter()
+            .cloned()
+            .map(|ptr| unsafe { CStr::from_ptr(ptr) })
+            .all(|ext_name| available_extensions.clone().any(|ext| ext.eq(ext_name)))
+        {
+            return Err(Error::MissingWindowingExtensions);
+        }
+
         const VK_KHRONOS_VALIDATION: &std::ffi::CStr = c"VK_LAYER_KHRONOS_validation";
+
         let mut enabled_extension_names = Vec::with_capacity(8);
+
         let mut enabled_layer_names = Vec::with_capacity(1);
+
+        enabled_extension_names.extend_from_slice(window_system_exts);
+
         let debug_enabled = debug_level != VulkanDebugLevel::None
             && available_extensions
                 .clone()
@@ -411,6 +485,7 @@ impl Instance {
                 )
                 .pfn_user_callback(Some(instance_debug_callback))
         });
+
         let mut ci = ash::vk::InstanceCreateInfo::default()
             .application_info(&app_info)
             .enabled_extension_names(&enabled_extension_names)
@@ -445,7 +520,7 @@ impl Instance {
         };
 
         Ok(Self {
-            _entry: entry,
+            entry,
             instance,
             debug_messenger,
         })
@@ -492,4 +567,55 @@ unsafe extern "system" fn instance_debug_callback(
     }
 
     ash::vk::FALSE
+}
+
+struct Surface {
+    surface_instance: ash::khr::surface::Instance,
+    surface: SurfaceKHR,
+    _parent_instance: Arc<Instance>,
+    _parent_window: Arc<Window>,
+}
+
+impl Drop for Surface {
+    fn drop(&mut self) {
+        //SAFETY: Last use of surface, all children destroyed
+        unsafe { self.surface_instance.destroy_surface(self.surface, None) };
+    }
+}
+
+#[derive(Debug, Error)]
+enum SurfaceCreateError {
+    #[error("Unknown Vulkan Error {0}")]
+    UnknownVulkan(ash::vk::Result),
+}
+
+impl From<ash::vk::Result> for SurfaceCreateError {
+    fn from(value: ash::vk::Result) -> Self {
+        SurfaceCreateError::UnknownVulkan(value)
+    }
+}
+
+impl Surface {
+    fn from_winit_window(
+        win: &Arc<Window>,
+        instance: &Arc<Instance>,
+    ) -> Result<Self, SurfaceCreateError> {
+        let surface_instance = ash::khr::surface::Instance::new(&instance.entry, instance);
+        let surface = unsafe {
+            ash_window::create_surface(
+                &instance.entry,
+                instance,
+                win.display_handle().unwrap().as_raw(),
+                win.window_handle().unwrap().as_raw(),
+                None,
+            )
+        }?;
+
+        Ok(Self {
+            surface_instance,
+            surface,
+            _parent_instance: instance.clone(),
+            _parent_window: win.clone(),
+        })
+    }
 }

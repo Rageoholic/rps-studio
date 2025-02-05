@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 app_dirs2 = "2.5.5"
 ash = "0.38.0"
+ash-window = "0.13.0"
 clap = { version = "4.5.28", features = ["derive"] }
 eyre = "0.6.12"
 strum = "0.26.3"

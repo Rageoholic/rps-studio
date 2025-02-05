@@ -8,7 +8,7 @@
             "type": "cppvsdbg",
             "name": "Launch",
             "preLaunchTask": "rust: cargo build",
-            "program": "${workspaceRoot}/target/debug/rpgs_studio.exe",
+            "program": "${workspaceRoot}/target/debug/rps-studio.exe",
             "request": "launch",
             "console": "integratedTerminal",
             "cwd": "${workspaceRoot}"
