@@ -1,3 +1,4 @@
+#![warn(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 use std::{
     ffi::{c_void, CStr},
     fmt::Debug,
@@ -417,7 +418,10 @@ impl Instance {
         display_handle: DisplayHandle,
     ) -> Result<Self, InstanceCreateError> {
         use InstanceCreateError as Error;
-        //SAFETY: Somewhat inherently unsafe due to loading a shared library which can run arbitrary initialization code. However, we are probably fine since
+        //SAFETY: Somewhat inherently unsafe due to loading a shared library
+        //which can run arbitrary initialization code. However, we are probably
+        //fine since this is the vulkan lib which means it *shouldn't* fuck with
+        //arbitrary memory or something stupid like that
         let entry = unsafe { ash::Entry::load() }.map_err(Error::EntryLoading)?;
 
         //TODO: Engine version, app name, app version
@@ -425,10 +429,13 @@ impl Instance {
             .api_version(minimum_vk_version.to_vk_version())
             .engine_name(c"RPS Studio");
 
-        //SAFETY: Basically always safe
-        let available_extensions_vec =
+        let available_extensions_vec = {
+            //SAFETY: Basically always safe because of ash. Only marked unsafe
+            //because it's technically an FFI call wrapper but ash manages the
+            //memory management for us
             unsafe { entry.enumerate_instance_extension_properties(None) }
-                .expect("Couldn't fetch extensions");
+                .expect("Couldn't fetch extensions")
+        };
 
         let available_extensions = available_extensions_vec.iter().map(|ext| {
             ext.extension_name_as_c_str()
@@ -450,7 +457,10 @@ impl Instance {
         if !window_system_exts
             .iter()
             .cloned()
-            .map(|ptr| unsafe { CStr::from_ptr(ptr) })
+            .map(|ptr|
+                //SAFETY: ash_window has to give us valid C Strings or the
+                //function is useless
+                unsafe { CStr::from_ptr(ptr) })
             .all(|ext_name| available_extensions.clone().any(|ext| ext.eq(ext_name)))
         {
             return Err(Error::MissingWindowingExtensions);
@@ -601,6 +611,9 @@ impl Surface {
         instance: &Arc<Instance>,
     ) -> Result<Self, SurfaceCreateError> {
         let surface_instance = ash::khr::surface::Instance::new(&instance.entry, instance);
+        //SAFETY: Passing a valid window and display handle. Enforces the
+        //parent/child relationship between the surface and the instance by
+        //holding onto an Arc to the instance
         let surface = unsafe {
             ash_window::create_surface(
                 &instance.entry,
