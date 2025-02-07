@@ -1,4 +1,12 @@
-#![warn(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
+//! CURRENTLY IN CONSTRUCTION
+
+#![warn(
+    unsafe_op_in_unsafe_fn,
+    clippy::undocumented_unsafe_blocks,
+    clippy::missing_docs_in_private_items
+)]
+
+/// Current Top Level crate for our app. Will break up in future
 use std::{
     ffi::{c_void, CStr},
     fmt::Debug,
@@ -24,42 +32,68 @@ use winit::{
     window::Window,
 };
 
+/// Our app info for app_dirs2
 const APP_INFO: AppInfo = AppInfo {
     name: "rps-studio",
     author: "Rageoholic",
 };
 
+/// State of the application while running
 struct RunningState {
+    /// Window that we are rendering to
     win: Arc<Window>,
+    /// Our vk instance
     instance: Arc<Instance>,
+    /// Surface corresponding to window
     _surface: Arc<Surface>,
 }
+
+/// State of the application while suspended
 struct SuspendedState {
+    /// Application window that is suspended
     win: Arc<Window>,
-    instance: Arc<Instance>,
-}
-struct UninitState {
+    /// Our vk instance
     instance: Arc<Instance>,
 }
 
+/// State of the app before initialization
+struct UninitState {
+    /// Our vk instance (contains pre-initialization stuff safe to make before we have a window)
+    instance: Arc<Instance>,
+}
+
+/// Enumeration of the app state. Represents an FSM
 enum AppState {
+    /// Uninitialized. Used before we enter the main loop.
     Uninit(UninitState),
+    /// Running. The event loop is in polling mode and will not wait for new
+    /// events
     Running(RunningState),
+    /// Suspended. The app is in wait mode and once all events are dispatched,
+    /// we will not resume until we recieve new events
     Suspended(SuspendedState),
+    /// Exited. The app has effectively ended its run
     Exiting,
 }
 
+/// Wrapper for AppState. Wraps in an option and allows operations like taking
+/// temporary Ownership of the AppState. THIS SHOULD NEVER BE NONE WHEN CONTROL
+/// IS RETURNED TO THE EVENT LOOP
 struct AppRunner {
+    /// Internal app_state. Should never be None outside of methods on AppRunner.
     app_state: Option<AppState>,
 }
 
 #[allow(dead_code)]
 impl AppRunner {
+    /// Construct an AppRunner from an UninitState
     fn new(us: UninitState) -> Self {
         Self {
             app_state: Some(AppState::Uninit(us)),
         }
     }
+
+    /// Peek at an uninit state
     fn as_uninit(&self) -> Option<&UninitState> {
         if let Some(AppState::Uninit(ref state)) = self.app_state {
             Some(state)
@@ -68,6 +102,7 @@ impl AppRunner {
         }
     }
 
+    /// Peek at a running state
     fn as_running(&self) -> Option<&RunningState> {
         if let Some(AppState::Running(ref state)) = self.app_state {
             Some(state)
@@ -76,6 +111,7 @@ impl AppRunner {
         }
     }
 
+    /// Peek at a suspended state
     fn as_suspended(&self) -> Option<&SuspendedState> {
         if let Some(AppState::Suspended(ref state)) = self.app_state {
             Some(state)
@@ -84,6 +120,7 @@ impl AppRunner {
         }
     }
 
+    /// Peek at an uninit state but mut
     fn as_uninit_mut(&mut self) -> Option<&mut UninitState> {
         if let Some(AppState::Uninit(ref mut state)) = self.app_state {
             Some(state)
@@ -92,6 +129,7 @@ impl AppRunner {
         }
     }
 
+    /// Peek at a running state but mut
     fn as_running_mut(&mut self) -> Option<&mut RunningState> {
         if let Some(AppState::Running(ref mut state)) = self.app_state {
             Some(state)
@@ -100,6 +138,7 @@ impl AppRunner {
         }
     }
 
+    /// Peek at a suspended state but mut
     fn as_suspended_mut(&mut self) -> Option<&mut SuspendedState> {
         if let Some(AppState::Suspended(ref mut state)) = self.app_state {
             Some(state)
@@ -108,6 +147,7 @@ impl AppRunner {
         }
     }
 
+    /// Take ownership of an Uninit state for a state transition
     fn take_uninit(&mut self) -> Option<UninitState> {
         self.as_uninit()
             .is_some()
@@ -119,6 +159,7 @@ impl AppRunner {
             })
     }
 
+    /// Take ownership of a running state for a state transition
     fn take_running(&mut self) -> Option<RunningState> {
         self.as_running()
             .is_some()
@@ -130,6 +171,7 @@ impl AppRunner {
             })
     }
 
+    /// Take ownership of a suspended state for a state transition
     fn take_suspended(&mut self) -> Option<SuspendedState> {
         self.as_suspended()
             .is_some()
@@ -144,6 +186,7 @@ impl AppRunner {
 
 impl ApplicationHandler for AppRunner {
     fn resumed(&mut self, event_loop: &event_loop::ActiveEventLoop) {
+        event_loop.set_control_flow(event_loop::ControlFlow::Wait);
         if let Some(UninitState { instance }) = self.take_uninit() {
             let win_attributes = Window::default_attributes().with_resizable(false);
             let win = Arc::new(match event_loop.create_window(win_attributes) {
@@ -196,6 +239,7 @@ impl ApplicationHandler for AppRunner {
             _surface: _,
         }) = self.take_running()
         {
+            event_loop.set_control_flow(event_loop::ControlFlow::Wait);
             self.app_state = Some(AppState::Suspended(SuspendedState { win, instance }))
         }
 
@@ -225,11 +269,14 @@ impl ApplicationHandler for AppRunner {
 }
 
 #[derive(clap::Parser, Debug)]
+/// Argument parser from clap
 struct Args {
     //TODO: Configure default to change based on build personality (e.g. release vs internal opt vs debug)
     #[arg(short, long, default_value_t = VulkanDebugLevel::Warn)]
+    /// What level to run validation layers at
     vulkan_debug_level: VulkanDebugLevel,
     #[arg(short, long, default_value_t=tracing::Level::WARN)]
+    /// What level to run Rust's logging at
     log_level: tracing::Level,
 }
 
@@ -284,8 +331,11 @@ fn main() -> eyre::Result<()> {
     Ok(())
 }
 
+/// NONOWNING implementation of a Debug Messenger. Meant only to be used in conjunction with Instance
 struct DebugMessenger {
+    /// The inner debug_messenger handle
     debug_messenger: DebugUtilsMessengerEXT,
+    /// The loaded extension function pointers and stuff
     debug_utils_instance: ash::ext::debug_utils::Instance,
 }
 
@@ -301,15 +351,24 @@ struct DebugMessenger {
     Clone,
     Copy,
 )]
+
+/// Represents a VkDebugUtilsMessageSeverityFlags option, representing itself
+/// and every option below it
 enum VulkanDebugLevel {
     #[default]
+    /// No debug layer messages
     None,
+    /// Print out all messages
     Verbose,
+    /// Print out useful information
     Info,
+    /// Print out warnings for misuse of certain APIs
     Warn,
+    /// Print out only errors like failing to destroy child objects
     Error,
 }
 impl VulkanDebugLevel {
+    /// Convert to the corresponding VkDebugUtilsMessageSeverityFlagsEXT
     fn sev_flags(&self) -> DebugUtilsMessageSeverityFlagsEXT {
         match self {
             VulkanDebugLevel::None => DebugUtilsMessageSeverityFlagsEXT::empty(),
@@ -327,9 +386,15 @@ impl VulkanDebugLevel {
     }
 }
 
+/// Represents a VkInstance and contains the Entry for proper management
+/// protocols. Also bundles the debug messenger.
 struct Instance {
+    /// Represents the entry point functions as well as an owned pointer to the
+    /// underlying vulkan shared library.
     entry: ash::Entry,
+    /// Represents a VkInstance and the corresponding function pointers
     instance: ash::Instance,
+    /// Represents a VkDebugUtilsMessengerEXT that may or may not be present
     debug_messenger: Option<DebugMessenger>,
 }
 impl Drop for Instance {
@@ -363,23 +428,35 @@ impl std::ops::Deref for Instance {
 }
 
 #[derive(Debug, thiserror::Error)]
+/// Possible errors returned by Instance::new
 enum InstanceCreateError {
     #[error("Unspecified vk error: {0}")]
+    /// Error has not been assigned a specific error variant. Some vk function
+    /// just done fucked up in an unforseen way
     UnspecifiedVulkan(ash::vk::Result),
     #[error("Error loading vulkan: {0}")]
+    /// Could not load our vulkan entry points from ash.
     EntryLoading(ash::LoadingError),
     #[error("Missing necessary window extensions")]
+    /// This vulkan impl does not implement the necessary extensions for
+    /// rendering (VK_SURFACE_KHR and the corresponding platform extension to
+    /// get a VkSurface)
     MissingWindowingExtensions,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// A simple version struct used for internal representation
 struct Version {
+    /// Major version
     major: u32,
+    /// Minor version
     minor: u32,
+    /// Patch Version
     patch: u32,
 }
 
 impl Version {
+    /// Constructs a Version from a major version, minor version, and patch version
     fn new(major: u32, minor: u32, patch: u32) -> Self {
         Self {
             major,
@@ -389,6 +466,16 @@ impl Version {
     }
 
     #[expect(dead_code)]
+    /// Constructs a Version from a Vulkan Version which looks approximately
+    /// like this(Bits are numbered from 0-31 where 31 is the highest bit)
+    ///
+    /// Bits 31-29: Variant (tossed away)
+    ///
+    /// Bits 28-22: Major (7 bits)
+    ///
+    /// Bits 21-12: Minor (10 bits)
+    ///
+    /// Bits 11-0: Patch (12 bits)
     fn from_vk_version(vk_version: u32) -> Self {
         let major = ash::vk::api_version_major(vk_version);
         let minor = ash::vk::api_version_minor(vk_version);
@@ -400,6 +487,7 @@ impl Version {
         }
     }
 
+    /// Converts from a Version to vulkan's internal version format as documented in `from_vk_version`
     fn to_vk_version(self) -> u32 {
         ash::vk::make_api_version(0, self.major, self.minor, self.patch)
     }
@@ -412,6 +500,7 @@ impl From<ash::vk::Result> for InstanceCreateError {
 }
 
 impl Instance {
+    /// Construct an instance. Debug Utils validation will be initialized to debug_level if possible
     fn new(
         minimum_vk_version: Version,
         debug_level: VulkanDebugLevel,
@@ -537,6 +626,7 @@ impl Instance {
     }
 }
 
+/// Debug Utils Messenger callback. Not for external calling
 unsafe extern "system" fn instance_debug_callback(
     message_severity: DebugUtilsMessageSeverityFlagsEXT,
     message_types: DebugUtilsMessageTypeFlagsEXT,
@@ -579,10 +669,17 @@ unsafe extern "system" fn instance_debug_callback(
     ash::vk::FALSE
 }
 
+/// Represents a VkSurfaceKHR.
 struct Surface {
+    /// Loaded function pointers for VK_SURFACE_KHR
     surface_instance: ash::khr::surface::Instance,
+    /// The underlying VkSurfaceKHR
     surface: SurfaceKHR,
+    /// Reference counted pointer to the instance. Here for RAII purposes as
+    /// Instance must be destroyed *after* surface
     _parent_instance: Arc<Instance>,
+    /// Reference counted pointer to the underlying window. Here for RAII
+    /// purposes as Window must be destroyed *after* surface
     _parent_window: Arc<Window>,
 }
 
@@ -594,8 +691,10 @@ impl Drop for Surface {
 }
 
 #[derive(Debug, Error)]
+/// The set of possible errors when creating a Surface
 enum SurfaceCreateError {
     #[error("Unknown Vulkan Error {0}")]
+    /// An error that has not yet been defined
     UnknownVulkan(ash::vk::Result),
 }
 
@@ -606,6 +705,7 @@ impl From<ash::vk::Result> for SurfaceCreateError {
 }
 
 impl Surface {
+    /// Uses a winit Window in order to create a surface
     fn from_winit_window(
         win: &Arc<Window>,
         instance: &Arc<Instance>,
