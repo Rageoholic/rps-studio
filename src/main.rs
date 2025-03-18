@@ -3,14 +3,17 @@
 #![warn(
     unsafe_op_in_unsafe_fn,
     clippy::undocumented_unsafe_blocks,
-    missing_debug_implementations
+    missing_debug_implementations,
+    clippy::unwrap_in_result,
+    clippy::allow_attributes_without_reason
 )]
 
 // // Uncomment to check for undocumented stuff
 //#![warn(clippy::missing_docs_in_private_items)]
 
 /// Current Top Level crate for our app. Will break up in future
-use std::{fmt::Debug, fs::File, path::PathBuf, sync::Arc};
+use core::fmt::Debug;
+use std::{fs::File, path::PathBuf, sync::Arc};
 
 use app_dirs2::AppInfo;
 
@@ -82,7 +85,6 @@ struct AppRunner {
     app_state: Option<AppState>,
 }
 
-#[allow(dead_code)]
 impl AppRunner {
     /// Construct an AppRunner from an UninitState
     fn new(us: UninitState) -> Self {
@@ -117,7 +119,7 @@ impl AppRunner {
             None
         }
     }
-
+    #[expect(dead_code, reason = "Simply unused currently but completes set")]
     /// Peek at an uninit state but mut
     fn as_uninit_mut(&mut self) -> Option<&mut UninitState> {
         if let Some(AppState::Uninit(ref mut state)) = self.app_state {
@@ -136,6 +138,7 @@ impl AppRunner {
         }
     }
 
+    #[expect(dead_code, reason = "Simply unused currently but completes set")]
     /// Peek at a suspended state but mut
     fn as_suspended_mut(&mut self) -> Option<&mut SuspendedState> {
         if let Some(AppState::Suspended(ref mut state)) = self.app_state {
@@ -371,7 +374,7 @@ impl Version {
         }
     }
 
-    #[expect(dead_code)]
+    #[expect(dead_code, reason = "simply unused rn")]
     /// Constructs a Version from a Vulkan Version which looks approximately
     /// like this(Bits are numbered from 0-31 where 31 is the highest bit)
     ///
@@ -494,28 +497,21 @@ mod mvk {
                     //SAFETY: Basically always safe because of ash. Only marked unsafe
                     //because it's technically an FFI call wrapper but ash manages the
                     //memory management for us
-                    unsafe { entry.enumerate_instance_extension_properties(None) }
-                        .expect("Couldn't fetch extensions")
+                    unsafe { entry.enumerate_instance_extension_properties(None) }?
                 };
 
-                let available_extensions = available_extensions_vec.iter().map(|ext| {
-                    ext.extension_name_as_c_str()
-                        .expect("Vulkan extensions should be able to be converted to C Strings")
-                });
+                let available_extensions = available_extensions_vec
+                    .iter()
+                    .map(|ext| ext.extension_name_as_c_str().unwrap_or(c""));
                 //SAFETY: Basically always safe
-                let available_layers_vec = unsafe { entry.enumerate_instance_layer_properties() }
-                    .expect("Couldn't fetch extensions");
+                let available_layers_vec = unsafe { entry.enumerate_instance_layer_properties() }?;
 
-                let available_layers = available_layers_vec.iter().map(|layer| {
-                    layer
-                        .layer_name_as_c_str()
-                        .expect("Vulkan layers should be abe to be converted to C Strings")
-                });
+                let available_layers = available_layers_vec
+                    .iter()
+                    .map(|layer| layer.layer_name_as_c_str().unwrap_or(c""));
 
-                let window_system_exts = ash_window::enumerate_required_extensions(
-                    display_handle.as_raw(),
-                )
-                .expect("Unable to get needed window system extensions from the Display Handle?");
+                let window_system_exts =
+                    ash_window::enumerate_required_extensions(display_handle.as_raw())?;
 
                 if !window_system_exts
                     .iter()
@@ -571,19 +567,13 @@ mod mvk {
                 //entry
                 let instance = unsafe { entry.create_instance(&ci, None) }?;
 
-                let debug_messenger = if debug_enabled {
+                let debug_messenger = if let Some(debug_ci) = debug_ci.as_ref() {
                     let debug_utils_instance =
                         ash::ext::debug_utils::Instance::new(&entry, &instance);
                     //SAFETY: We follow all of vulkan's rules
                     let debug_messenger = unsafe {
-                        debug_utils_instance.create_debug_utils_messenger(
-                            debug_ci
-                                .as_ref()
-                                .expect("If debug_enabled is true, we always fill out the ci"),
-                            None,
-                        )
-                    }
-                    .expect("How did we fail to build the debug messenger?");
+                        debug_utils_instance.create_debug_utils_messenger(debug_ci, None)
+                    }?;
                     Some(DebugMessenger {
                         debug_messenger,
                         debug_utils_instance,
@@ -766,6 +756,12 @@ mod mvk {
             #[error("Unknown Vulkan Error {0}")]
             /// An error that has not yet been defined
             UnknownVulkan(ash::vk::Result),
+            /// Couldn't get a display handle
+            #[error("Couldn't get display handle")]
+            InvalidDisplayHandle,
+            /// Couldn't get a window handle
+            #[error("Couldn't get window handle")]
+            InvalidWindowHandle,
         }
 
         impl From<ash::vk::Result> for SurfaceCreateError {
@@ -789,8 +785,12 @@ mod mvk {
                     ash_window::create_surface(
                         &instance.entry,
                         &instance.instance,
-                        win.display_handle().unwrap().as_raw(),
-                        win.window_handle().unwrap().as_raw(),
+                        win.display_handle()
+                            .map_err(|_| SurfaceCreateError::InvalidDisplayHandle)?
+                            .as_raw(),
+                        win.window_handle()
+                            .map_err(|_| SurfaceCreateError::InvalidWindowHandle)?
+                            .as_raw(),
                         None,
                     )
                 }?;
@@ -864,7 +864,7 @@ mod mvk {
         }
 
         #[derive(Debug)]
-        #[allow(dead_code)]
+        #[expect(dead_code, reason = "We aren't using all of these members yet")]
         struct ScoredPhysDev<'a> {
             phys_dev: vk::PhysicalDevice,
             score: u32,
@@ -946,7 +946,7 @@ mod mvk {
                                 .surface_instance
                                 .get_physical_device_surface_formats(current, surface.surface)
                         }
-                        .expect("What do you mean we can't get surface formats?");
+                        .ok()?;
 
                         // SAFETY: current and surface are derived from the same instance
                         let present_modes = unsafe {
@@ -996,14 +996,13 @@ mod mvk {
                                         surface.surface,
                                     )
                             }
-                            .unwrap();
+                            .unwrap_or(false);
                             props.queue_flags.contains(QueueFlags::GRAPHICS) && present_support
                         });
 
-                        let ext_names_iter = ext_props.iter().map(|ext| {
-                            ext.extension_name_as_c_str()
-                                .expect("What do you mean vulkan didn't give us valid C Strings?")
-                        });
+                        let ext_names_iter = ext_props
+                            .iter()
+                            .map(|ext| ext.extension_name_as_c_str().unwrap_or(c""));
 
                         let swapchain_ext_present = ext_names_iter
                             .clone()
