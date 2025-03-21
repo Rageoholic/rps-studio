@@ -4,7 +4,6 @@
     unsafe_op_in_unsafe_fn,
     clippy::undocumented_unsafe_blocks,
     missing_debug_implementations,
-    clippy::unwrap_in_result,
     clippy::allow_attributes_without_reason
 )]
 
@@ -24,7 +23,7 @@ use winit::{
     raw_window_handle::HasDisplayHandle, window::Window,
 };
 
-use mvk::{Device, Instance, Surface, VulkanDebugLevel};
+use rvk::{Device, Instance, Surface, VulkanDebugLevel};
 
 /// Our app info for app_dirs2
 const APP_INFO: AppInfo = AppInfo {
@@ -207,7 +206,8 @@ impl ApplicationHandler for AppRunner {
                     return;
                 }
             };
-            let device = match Device::create_compatible(&instance, &surface) {
+            let device = match Device::create_compatible(&instance, &surface, Version::new(1, 3, 0))
+            {
                 Ok(d) => Arc::new(d),
                 Err(e) => {
                     tracing::error!("Could not create device: Error {}", e);
@@ -402,7 +402,7 @@ impl Version {
     }
 }
 
-mod mvk {
+mod rvk {
 
     pub(crate) use device::Device;
     pub(crate) use instance::{Instance, VulkanDebugLevel};
@@ -814,6 +814,8 @@ mod mvk {
         };
         use thiserror::Error;
 
+        use crate::Version;
+
         use super::{Instance, Surface};
 
         /// Represents a VkDevice
@@ -887,6 +889,7 @@ mod mvk {
             pub(crate) fn create_compatible(
                 instance: &Arc<Instance>,
                 surface: &Surface,
+                min_api_version: Version,
             ) -> Result<Self, DeviceCreateError> {
                 use DeviceCreateError as Error;
                 if !Arc::ptr_eq(instance, &surface.parent_instance) {
@@ -921,6 +924,11 @@ mod mvk {
                                 .instance
                                 .get_physical_device_properties2(current, &mut props)
                         };
+
+                        //Early return when this doesn't support our min api version
+                        if props.properties.api_version < min_api_version.to_vk_version() {
+                            return best_so_far;
+                        }
 
                         let mut current_dev_mem_props =
                             vk::PhysicalDeviceMemoryProperties2::default();
@@ -1078,15 +1086,6 @@ mod mvk {
                     .enabled_extension_names(&enabled_extensions)
                     .push_next(&mut features)
                     .queue_create_infos(&qcis);
-
-                println!(
-                    "pCreateInfo->pEnabled_features = {}",
-                    if dci.p_enabled_features.is_null() {
-                        "null"
-                    } else {
-                        "not null"
-                    }
-                );
 
                 //SAFETY: Valid ci. phys_dev is derived from instance
                 let device = unsafe {
