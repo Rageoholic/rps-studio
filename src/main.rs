@@ -461,17 +461,17 @@ mod rvk {
         /// Thing that we render to
         pub struct Swapchain {
             /// Device that we were made with
-            pub(super) parent_device: Arc<Device>,
+            parent_device: Arc<Device>,
             /// Surface that we were made with
-            pub(super) parent_surface: Arc<Surface>,
+            parent_surface: Arc<Surface>,
             /// Loaded extension function pointers
-            pub(super) swapchain_device: ash::khr::swapchain::Device,
+            swapchain_device: ash::khr::swapchain::Device,
             /// Actual handle to the surface
-            pub(super) swapchain: SwapchainKHR,
+            swapchain: SwapchainKHR,
             /// Images associated with the swapchain
-            pub(super) _images: Vec<Image>,
+            _images: Vec<Image>,
             /// Image views associated with above images
-            pub(super) image_views: Vec<ImageView>,
+            image_views: Vec<ImageView>,
         }
         #[derive(thiserror::Error, Debug)]
 
@@ -504,7 +504,7 @@ mod rvk {
                 device: &Arc<Device>,
                 surface: &Arc<Surface>,
             ) -> Result<Swapchain, SwapchainCreateError> {
-                if device.parent.handle() != surface.parent_instance.handle() {
+                if device.get_parent().raw_handle() != surface.parent_instance().raw_handle() {
                     return Err(SwapchainCreateError::IncompatibleParameters);
                 }
                 let swapchain_device = ash::khr::swapchain::Device::new(
@@ -572,7 +572,7 @@ mod rvk {
                     .image_array_layers(1)
                     .image_sharing_mode(SharingMode::EXCLUSIVE)
                     .image_usage(ImageUsageFlags::COLOR_ATTACHMENT)
-                    .surface(surface.surface)
+                    .surface(surface.inner())
                     .pre_transform(SurfaceTransformFlagsKHR::IDENTITY)
                     .composite_alpha(CompositeAlphaFlagsKHR::OPAQUE);
 
@@ -644,9 +644,12 @@ mod rvk {
 
     /// Functionality related to the instance. Exists for scoping reasons
     mod instance {
-        use ash::vk::{
-            self, DebugUtilsMessageSeverityFlagsEXT, DebugUtilsMessageTypeFlagsEXT,
-            DebugUtilsMessengerEXT,
+        use ash::{
+            vk::{
+                self, DebugUtilsMessageSeverityFlagsEXT, DebugUtilsMessageTypeFlagsEXT,
+                DebugUtilsMessengerEXT,
+            },
+            Entry,
         };
         use debug_messenger::instance_debug_callback;
         use std::{ffi::CStr, fmt::Debug};
@@ -659,11 +662,11 @@ mod rvk {
         pub struct Instance {
             /// Represents the entry point functions as well as an owned pointer to the
             /// underlying vulkan shared library.
-            pub(super) entry: ash::Entry,
+            entry: ash::Entry,
             /// Represents a VkInstance and the corresponding function pointers
-            pub(super) instance: ash::Instance,
+            instance: ash::Instance,
             /// Represents a VkDebugUtilsMessengerEXT that may or may not be present
-            pub(super) debug_messenger: Option<DebugMessenger>,
+            debug_messenger: Option<DebugMessenger>,
         }
         impl Drop for Instance {
             fn drop(&mut self) {
@@ -710,8 +713,16 @@ mod rvk {
         }
 
         impl Instance {
+            /// Get a reference to the associated debug messenger
+            pub(super) fn get_debug_messenger(&self) -> Option<&DebugMessenger> {
+                self.debug_messenger.as_ref()
+            }
+            /// Get a ref to the ash::Entry associated with this instance
+            pub(super) fn parent(&self) -> &Entry {
+                &self.entry
+            }
             /// Get the Instance handle for comparing with other handles
-            pub(super) fn handle(&self) -> ash::vk::Instance {
+            pub(super) fn raw_handle(&self) -> ash::vk::Instance {
                 self.inner().handle()
             }
             /// Get the ash Instance for passing to ash
@@ -970,12 +981,12 @@ mod rvk {
         /// Represents a VkSurfaceKHR.
         pub(crate) struct Surface {
             /// Loaded function pointers for VK_SURFACE_KHR
-            pub(super) surface_instance: ash::khr::surface::Instance,
+            surface_instance: ash::khr::surface::Instance,
             /// The underlying VkSurfaceKHR
-            pub(super) surface: SurfaceKHR,
+            surface: SurfaceKHR,
             /// Reference counted pointer to the instance. Here for RAII purposes as
             /// Instance must be destroyed *after* surface
-            pub(super) parent_instance: Arc<Instance>,
+            parent_instance: Arc<Instance>,
             /// Reference counted pointer to the underlying window. Here for RAII
             /// purposes as Window must be destroyed *after* surface
             parent_window: Arc<Window>,
@@ -1020,6 +1031,15 @@ mod rvk {
         }
 
         impl Surface {
+            ///Get reference to the parent instance
+            pub(super) fn parent_instance(&self) -> &Arc<Instance> {
+                &self.parent_instance
+            }
+
+            ///Get a handle to the inner surface for whenever necessary
+            pub(super) fn inner(&self) -> ash::vk::SurfaceKHR {
+                self.surface
+            }
             /// Get the extent of the surface in Vulkan terms
             pub fn get_surface_extent(&self) -> Extent2D {
                 let inner_size = self.parent_window.inner_size();
@@ -1042,7 +1062,7 @@ mod rvk {
                 //the same instance as us to the caller
                 unsafe {
                     self.surface_instance
-                        .get_physical_device_surface_formats(device.phys_dev, self.surface)
+                        .get_physical_device_surface_formats(device.get_phys_dev(), self.surface)
                 }
             }
 
@@ -1059,7 +1079,10 @@ mod rvk {
                 //the same instance as us to the caller
                 unsafe {
                     self.surface_instance
-                        .get_physical_device_surface_present_modes(device.phys_dev, self.surface)
+                        .get_physical_device_surface_present_modes(
+                            device.get_phys_dev(),
+                            self.surface,
+                        )
                 }
             }
 
@@ -1077,7 +1100,7 @@ mod rvk {
                 //SAFETY: Surface and Device are from the same instance
                 unsafe {
                     self.surface_instance.get_physical_device_surface_support(
-                        device._get_phys_dev(),
+                        device.get_phys_dev(),
                         queue_family_index,
                         self.surface,
                     )
@@ -1097,7 +1120,10 @@ mod rvk {
                 //the same instance as us to the caller
                 unsafe {
                     self.surface_instance
-                        .get_physical_device_surface_capabilities(device.phys_dev, self.surface)
+                        .get_physical_device_surface_capabilities(
+                            device.get_phys_dev(),
+                            self.surface,
+                        )
                 }
             }
             /// Uses a winit Window in order to create a surface
@@ -1106,14 +1132,14 @@ mod rvk {
                 instance: &Arc<Instance>,
             ) -> Result<Self, SurfaceCreateError> {
                 let surface_instance =
-                    ash::khr::surface::Instance::new(&instance.entry, &instance.instance);
+                    ash::khr::surface::Instance::new(instance.parent(), instance.inner());
                 //SAFETY: Passing a valid window and display handle. Enforces
                 //the parent/child relationship between the surface and the
                 //instance/window by holding onto an Arc to the instance/window
                 let surface = unsafe {
                     ash_window::create_surface(
-                        &instance.entry,
-                        &instance.instance,
+                        instance.parent(),
+                        instance.inner(),
                         win.display_handle()
                             .map_err(|_| SurfaceCreateError::InvalidDisplayHandle)?
                             .as_raw(),
@@ -1130,6 +1156,10 @@ mod rvk {
                     parent_instance: instance.clone(),
                     parent_window: win.clone(),
                 })
+            }
+            /// Return a ref to the surface instance
+            pub(crate) fn surface_instance(&self) -> &ash::khr::surface::Instance {
+                &self.surface_instance
             }
         }
     }
@@ -1156,15 +1186,15 @@ mod rvk {
         /// Represents a VkDevice
         pub(crate) struct Device {
             /// Parent for RAII purposes
-            pub(super) parent: Arc<Instance>,
+            parent: Arc<Instance>,
             ///Underlying VkDevice
-            pub(super) device: ash::Device,
+            device: ash::Device,
             /// A set of function pointers for interacting with the
             /// DebugMessenger in parent
-            pub(super) debug_utils_fps: Option<ash::ext::debug_utils::Device>,
+            debug_utils_fps: Option<ash::ext::debug_utils::Device>,
             /// Handle to the physical device. Need to keep it around for some
             /// stuff
-            pub(super) phys_dev: vk::PhysicalDevice,
+            phys_dev: vk::PhysicalDevice,
             /// Handle to the queue we will submit graphics to
             _graphics_queue: vk::Queue,
             /// Index of the graphics queue family
@@ -1231,6 +1261,10 @@ mod rvk {
             formats: Vec<vk::SurfaceFormatKHR>,
         }
         impl Device {
+            ///Get a reference to the parent instance
+            pub(crate) fn get_parent(&self) -> &Instance {
+                &self.parent
+            }
             ///Creates a raw image view. Generally for internal use.
             ///
             /// SAFETY: ci.image must be associated with this device. Otherwise
@@ -1268,7 +1302,7 @@ mod rvk {
                 min_api_version: Version,
             ) -> Result<Self, DeviceCreateError> {
                 use DeviceCreateError as Error;
-                if !Arc::ptr_eq(instance, &surface.parent_instance) {
+                if !Arc::ptr_eq(instance, surface.parent_instance()) {
                     return Err(Error::InstanceSurfaceMismatch);
                 }
                 let phys_devs = instance.enumerate_physical_devices()?;
@@ -1278,7 +1312,7 @@ mod rvk {
                         // instance
                         let ext_props = match unsafe {
                             instance
-                                .instance
+                                .inner()
                                 .enumerate_device_extension_properties(current)
                         } {
                             Ok(exts) => exts,
@@ -1299,7 +1333,7 @@ mod rvk {
                         // current_dev_props
                         unsafe {
                             instance
-                                .instance
+                                .inner()
                                 .get_physical_device_properties2(current, &mut props)
                         };
 
@@ -1314,7 +1348,7 @@ mod rvk {
 
                         // Safety: current is derived from instance
                         unsafe {
-                            instance.instance.get_physical_device_memory_properties2(
+                            instance.inner().get_physical_device_memory_properties2(
                                 current,
                                 &mut current_dev_mem_props,
                             );
@@ -1324,15 +1358,15 @@ mod rvk {
                         // instance
                         let surface_capabilities = unsafe {
                             surface
-                                .surface_instance
-                                .get_physical_device_surface_capabilities(current, surface.surface)
+                                .surface_instance()
+                                .get_physical_device_surface_capabilities(current, surface.inner())
                         };
 
                         // Safety: surface and current are derived from instance
                         let formats = unsafe {
                             surface
-                                .surface_instance
-                                .get_physical_device_surface_formats(current, surface.surface)
+                                .surface_instance()
+                                .get_physical_device_surface_formats(current, surface.inner())
                         }
                         .ok()?;
 
@@ -1340,8 +1374,8 @@ mod rvk {
                         // instance
                         let present_modes = unsafe {
                             surface
-                                .surface_instance
-                                .get_physical_device_surface_present_modes(current, surface.surface)
+                                .surface_instance()
+                                .get_physical_device_surface_present_modes(current, surface.inner())
                         };
 
                         let mut features_11 = vk::PhysicalDeviceVulkan11Features::default();
@@ -1355,7 +1389,7 @@ mod rvk {
                         // SAFETY: current is derived from instance
                         unsafe {
                             instance
-                                .instance
+                                .inner()
                                 .get_physical_device_features2(current, &mut features);
                         }
 
@@ -1372,7 +1406,7 @@ mod rvk {
                         //management for us
                         let qfis = unsafe {
                             instance
-                                .instance
+                                .inner()
                                 .get_physical_device_queue_family_properties(current)
                         };
                         let graphics_qfi = qfis.iter().cloned().enumerate().find(|(qfi, props)| {
@@ -1380,11 +1414,11 @@ mod rvk {
                             // instance
                             let present_support = unsafe {
                                 surface
-                                    .surface_instance
+                                    .surface_instance()
                                     .get_physical_device_surface_support(
                                         current,
                                         *qfi as u32,
-                                        surface.surface,
+                                        surface.inner(),
                                     )
                             }
                             .unwrap_or(false);
@@ -1473,14 +1507,14 @@ mod rvk {
                 //SAFETY: Valid ci. phys_dev is derived from instance
                 let device = unsafe {
                     instance
-                        .instance
+                        .inner()
                         .create_device(scored_phys_dev.phys_dev, &dci, None)
                 }?;
 
                 let debug_utils_fps = instance
-                    .debug_messenger
+                    .get_debug_messenger()
                     .is_some()
-                    .then(|| ash::ext::debug_utils::Device::new(&instance.instance, &device));
+                    .then(|| ash::ext::debug_utils::Device::new(instance.inner(), &device));
 
                 //SAFETY: graphics_qfi was passed in for one of the QCIs. Queue index is 0
                 let graphics_queue =
@@ -1497,7 +1531,7 @@ mod rvk {
             }
 
             /// Returns a handle to the associated physical device
-            pub(crate) fn _get_phys_dev(&self) -> vk::PhysicalDevice {
+            pub(crate) fn get_phys_dev(&self) -> vk::PhysicalDevice {
                 self.phys_dev
             }
         }
