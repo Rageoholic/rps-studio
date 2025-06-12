@@ -4,11 +4,11 @@
     unsafe_op_in_unsafe_fn,
     clippy::undocumented_unsafe_blocks,
     missing_debug_implementations,
-    clippy::allow_attributes_without_reason
+    clippy::allow_attributes_without_reason,
+    clippy::missing_safety_doc
 )]
-
-// // Uncomment to check for undocumented stuff
-//#![warn(clippy::missing_docs_in_private_items)]
+// Uncomment to check for undocumented stuff
+#![warn(clippy::missing_docs_in_private_items)]
 
 /// Current Top Level crate for our app. Will break up in future
 use core::fmt::Debug;
@@ -23,7 +23,7 @@ use winit::{
     raw_window_handle::HasDisplayHandle, window::Window,
 };
 
-use rvk::{Device, Instance, Surface, VulkanDebugLevel};
+use rvk::{Device, Instance, Surface, Swapchain, VulkanDebugLevel};
 
 /// Our app info for app_dirs2
 const APP_INFO: AppInfo = AppInfo {
@@ -40,7 +40,10 @@ struct RunningState {
     instance: Arc<Instance>,
     /// Surface corresponding to window
     _surface: Arc<Surface>,
+    /// handle to the GPU device
     device: Arc<Device>,
+    /// A swapchain we are currently using
+    _swapchain: Swapchain,
 }
 
 /// State of the application while suspended
@@ -50,13 +53,15 @@ struct SuspendedState {
     win: Arc<Window>,
     /// Our vk instance
     instance: Arc<Instance>,
+    /// handle to GPU device
     device: Arc<Device>,
 }
 
 /// State of the app before initialization
 #[derive(Debug)]
 struct UninitState {
-    /// Our vk instance (contains pre-initialization stuff safe to make before we have a window)
+    /// Our vk instance (contains pre-initialization stuff safe to make before
+    /// we have a window)
     instance: Arc<Instance>,
 }
 
@@ -80,7 +85,8 @@ enum AppState {
 /// IS RETURNED TO THE EVENT LOOP
 #[derive(Debug)]
 struct AppRunner {
-    /// Internal app_state. Should never be None outside of methods on AppRunner.
+    /// Internal app_state. Should never be None outside of methods on
+    /// AppRunner.
     app_state: Option<AppState>,
 }
 
@@ -186,9 +192,10 @@ impl AppRunner {
 
 impl ApplicationHandler for AppRunner {
     fn resumed(&mut self, event_loop: &event_loop::ActiveEventLoop) {
-        event_loop.set_control_flow(event_loop::ControlFlow::Wait);
         if let Some(UninitState { instance }) = self.take_uninit() {
-            let win_attributes = Window::default_attributes().with_resizable(false);
+            let win_attributes = Window::default_attributes()
+                .with_resizable(false)
+                .with_visible(false);
             let win = Arc::new(match event_loop.create_window(win_attributes) {
                 Ok(win) => win,
                 Err(e) => {
@@ -216,14 +223,25 @@ impl ApplicationHandler for AppRunner {
                 }
             };
 
+            let swapchain = match Swapchain::create(&device, &surface) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("Could not create swapchain: Error {}", e);
+                    event_loop.exit();
+                    return;
+                }
+            };
+
+            win.set_visible(true);
+
             self.app_state = Some(AppState::Running(RunningState {
                 win,
                 instance,
                 _surface: surface,
                 device,
+                _swapchain: swapchain,
             }))
-        }
-        if let Some(SuspendedState {
+        } else if let Some(SuspendedState {
             win,
             instance,
             device,
@@ -237,11 +255,20 @@ impl ApplicationHandler for AppRunner {
                     return;
                 }
             };
+            let swapchain = match Swapchain::create(&device, &surface) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("Could not recreate swapchain: Error {}", e);
+                    event_loop.exit();
+                    return;
+                }
+            };
             self.app_state = Some(AppState::Running(RunningState {
                 win,
                 instance,
                 _surface: surface,
                 device,
+                _swapchain: swapchain,
             }));
         }
 
@@ -254,6 +281,7 @@ impl ApplicationHandler for AppRunner {
             win,
             _surface: _,
             device,
+            _swapchain: _,
         }) = self.take_running()
         {
             event_loop.set_control_flow(event_loop::ControlFlow::Wait);
@@ -277,14 +305,18 @@ impl ApplicationHandler for AppRunner {
             instance: _,
             _surface: _,
             device: _,
+            _swapchain: _,
         }) = self.as_running_mut()
         {
-            match event {
-                WindowEvent::CloseRequested if window_id == win.id() => {
-                    self.app_state = Some(AppState::Exiting);
-                    event_loop.exit();
+            if win.id() == window_id {
+                match event {
+                    WindowEvent::CloseRequested if window_id == win.id() => {
+                        win.set_visible(false);
+                        self.app_state = Some(AppState::Exiting);
+                        event_loop.exit();
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
     }
@@ -293,7 +325,8 @@ impl ApplicationHandler for AppRunner {
 #[derive(clap::Parser, Debug)]
 /// Argument parser from clap
 struct Args {
-    //TODO: Configure default to change based on build personality (e.g. release vs internal opt vs debug)
+    //TODO: Configure default to change based on build personality (e.g. release
+    //vs internal opt vs debug)
     #[arg(short, long, default_value_t = VulkanDebugLevel::Warn)]
     /// What level to run validation layers at
     vulkan_debug_level: VulkanDebugLevel,
@@ -304,7 +337,6 @@ struct Args {
 
 fn main() -> eyre::Result<()> {
     let args = Args::parse();
-    println!("Hello, world!");
 
     let app_data_dir = app_dirs2::app_root(app_dirs2::AppDataType::UserData, &APP_INFO)?;
 
@@ -339,6 +371,7 @@ fn main() -> eyre::Result<()> {
         ))
         .init();
 
+    tracing::warn!("Starting app");
     let event_loop = winit::event_loop::EventLoop::builder().build()?;
     let instance = Arc::new(Instance::new(
         Version::new(1, 3, 0),
@@ -365,7 +398,8 @@ struct Version {
 }
 
 impl Version {
-    /// Constructs a Version from a major version, minor version, and patch version
+    /// Constructs a Version from a major version, minor version, and patch
+    /// version
     fn new(major: u32, minor: u32, patch: u32) -> Self {
         Self {
             major,
@@ -396,18 +430,219 @@ impl Version {
         }
     }
 
-    /// Converts from a Version to vulkan's internal version format as documented in `from_vk_version`
+    /// Converts from a Version to vulkan's internal version format as
+    /// documented in `from_vk_version`
     fn to_vk_version(self) -> u32 {
         ash::vk::make_api_version(0, self.major, self.minor, self.patch)
     }
 }
 
+/// My personal wrapper around vulkan
 mod rvk {
 
     pub(crate) use device::Device;
     pub(crate) use instance::{Instance, VulkanDebugLevel};
     pub(crate) use surface::Surface;
+    pub(crate) use swapchain::Swapchain;
 
+    /// Implement swapchain related functionality
+    mod swapchain {
+        use std::{fmt::Debug, sync::Arc};
+
+        use ash::vk::{
+            ColorSpaceKHR, ComponentMapping, CompositeAlphaFlagsKHR, Extent2D, Format, Image,
+            ImageAspectFlags, ImageSubresourceRange, ImageUsageFlags, ImageView,
+            ImageViewCreateInfo, ImageViewType, PresentModeKHR, SharingMode,
+            SurfaceTransformFlagsKHR, SwapchainCreateInfoKHR, SwapchainKHR,
+        };
+
+        use super::{Device, Surface};
+
+        /// Thing that we render to
+        pub struct Swapchain {
+            /// Device that we were made with
+            pub(super) parent_device: Arc<Device>,
+            /// Surface that we were made with
+            pub(super) parent_surface: Arc<Surface>,
+            /// Loaded extension function pointers
+            pub(super) swapchain_device: ash::khr::swapchain::Device,
+            /// Actual handle to the surface
+            pub(super) swapchain: SwapchainKHR,
+            /// Images associated with the swapchain
+            pub(super) _images: Vec<Image>,
+            /// Image views associated with above images
+            pub(super) image_views: Vec<ImageView>,
+        }
+        #[derive(thiserror::Error, Debug)]
+
+        /// Errors that pop up when we create a swapchain
+        pub enum SwapchainCreateError {
+            /// We don't know what went wrong but vulkan did it. Effectively the
+            /// default shrug answer
+            #[error("Unknown Vulkan error {0}")]
+            UnknownVulkan(ash::vk::Result),
+            /// You passed in a surface and device that are not derived from the
+            /// same instance
+            #[error("Incompatible parameters (device and surface are not from same instance)")]
+            IncompatibleParameters,
+            /// For some reason we can't pick a format. So we can't create a swapchain. Should basically
+            /// never happen
+            #[error("No compatible format found")]
+            NoCompatibleFormat,
+        }
+        impl From<ash::vk::Result> for SwapchainCreateError {
+            fn from(value: ash::vk::Result) -> Self {
+                Self::UnknownVulkan(value)
+            }
+        }
+
+        impl Swapchain {
+            /// Create a swapchain from this device and surface. Might wanna
+            /// make some optional parameters to configure? But rn this is
+            /// wrapping how *I* set up a swapchain
+            pub(crate) fn create(
+                device: &Arc<Device>,
+                surface: &Arc<Surface>,
+            ) -> Result<Swapchain, SwapchainCreateError> {
+                if device.parent.handle() != surface.parent_instance.handle() {
+                    return Err(SwapchainCreateError::IncompatibleParameters);
+                }
+                let swapchain_device = ash::khr::swapchain::Device::new(
+                    device.parent_instance().inner(),
+                    device.inner(),
+                );
+
+                //SAFETY: surface and device are derived from the same instance
+                let (surface_capabilities, surface_formats, present_modes) = unsafe {
+                    (
+                        surface.get_capabilities_unsafe(device)?,
+                        surface.get_formats_unsafe(device)?,
+                        surface.get_present_modes_unsafe(device)?,
+                    )
+                };
+
+                let present_mode = present_modes
+                    .iter()
+                    .find(|pm| **pm == PresentModeKHR::MAILBOX)
+                    .copied()
+                    .unwrap_or(PresentModeKHR::FIFO);
+
+                let surface_format = surface_formats
+                    .iter()
+                    .find(|format| {
+                        format.color_space == ColorSpaceKHR::SRGB_NONLINEAR
+                            && format.format == Format::B8G8R8A8_SRGB
+                    })
+                    .copied()
+                    .or(surface_formats.first().copied())
+                    .ok_or(SwapchainCreateError::NoCompatibleFormat)?;
+
+                let swapchain_extent = if surface_capabilities.current_extent.width != u32::MAX {
+                    surface_capabilities.current_extent
+                } else {
+                    let surface_extent = surface.get_surface_extent();
+
+                    Extent2D {
+                        width: surface_extent.width.clamp(
+                            surface_capabilities.min_image_extent.width,
+                            surface_capabilities.max_image_extent.height,
+                        ),
+                        height: surface_extent.height.clamp(
+                            surface_capabilities.min_image_extent.height,
+                            surface_capabilities.max_image_extent.height,
+                        ),
+                    }
+                };
+                let default_image_count = surface_capabilities.min_image_count + 1;
+                let max_image_count = surface_capabilities.max_image_count;
+                let requested_image_count =
+                    if max_image_count != 0 && max_image_count < default_image_count {
+                        max_image_count
+                    } else {
+                        default_image_count
+                    };
+
+                //TODO: Different image sharing mode?
+                let ci = SwapchainCreateInfoKHR::default()
+                    .present_mode(present_mode)
+                    .image_color_space(surface_format.color_space)
+                    .image_format(surface_format.format)
+                    .image_extent(swapchain_extent)
+                    .min_image_count(requested_image_count)
+                    .image_array_layers(1)
+                    .image_sharing_mode(SharingMode::EXCLUSIVE)
+                    .image_usage(ImageUsageFlags::COLOR_ATTACHMENT)
+                    .surface(surface.surface)
+                    .pre_transform(SurfaceTransformFlagsKHR::IDENTITY)
+                    .composite_alpha(CompositeAlphaFlagsKHR::OPAQUE);
+
+                //SAFETY: Valid ci
+                let swapchain = unsafe { swapchain_device.create_swapchain(&ci, None) }?;
+
+                //SAFETY: Swapchain was made from this swapchain_device
+                let images = unsafe { swapchain_device.get_swapchain_images(swapchain) }?;
+
+                let mut image_views = Vec::with_capacity(images.len());
+
+                for image in &images {
+                    let ivci = ImageViewCreateInfo::default()
+                        .image(*image)
+                        .view_type(ImageViewType::TYPE_2D)
+                        .components(ComponentMapping::default())
+                        .format(surface_format.format)
+                        .subresource_range(
+                            ImageSubresourceRange::default()
+                                .aspect_mask(ImageAspectFlags::COLOR)
+                                .base_mip_level(0)
+                                .level_count(1)
+                                .base_array_layer(0)
+                                .layer_count(1),
+                        );
+
+                    //SAFETY: ivci.image was created from the swapchain which is
+                    //derived from device
+                    let iv = unsafe { device.create_image_view_raw(&ivci) }?;
+                    image_views.push(iv);
+                }
+
+                Ok(Self {
+                    parent_device: device.clone(),
+                    parent_surface: surface.clone(),
+                    swapchain,
+                    swapchain_device,
+                    _images: images,
+                    image_views,
+                })
+            }
+        }
+
+        impl Debug for Swapchain {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("Swapchain")
+                    .field("parent_device", &self.parent_device)
+                    .field("parent_surface", &self.parent_surface)
+                    .field("swapchain_device", &"{opaque}")
+                    .field("swapchain", &self.swapchain)
+                    .finish()
+            }
+        }
+
+        impl Drop for Swapchain {
+            fn drop(&mut self) {
+                for iv in self.image_views.drain(..) {
+                    //SAFETY: iv was created on this device
+                    unsafe { self.parent_device.destroy_image_view_raw(iv) };
+                }
+                //SAFETY: Swapchain was made with this swapchain_device
+                unsafe {
+                    self.swapchain_device
+                        .destroy_swapchain(self.swapchain, None)
+                };
+            }
+        }
+    }
+
+    /// Functionality related to the instance. Exists for scoping reasons
     mod instance {
         use ash::vk::{
             self, DebugUtilsMessageSeverityFlagsEXT, DebugUtilsMessageTypeFlagsEXT,
@@ -475,6 +710,14 @@ mod rvk {
         }
 
         impl Instance {
+            /// Get the Instance handle for comparing with other handles
+            pub(super) fn handle(&self) -> ash::vk::Instance {
+                self.inner().handle()
+            }
+            /// Get the ash Instance for passing to ash
+            pub(super) fn inner(&self) -> &ash::Instance {
+                &self.instance
+            }
             /// Construct an instance. Debug Utils validation will be initialized to debug_level if possible
             pub fn new(
                 minimum_vk_version: Version,
@@ -598,6 +841,7 @@ mod rvk {
             }
         }
 
+        /// Functionality related to the debug manager
         mod debug_messenger {
             use std::ffi::c_void;
 
@@ -639,13 +883,13 @@ mod rvk {
                     ty_name.push_str("VALIDATION");
                 }
                 if message_severity.contains(SevFlags::ERROR) {
-                    tracing::error!("{ty_name}: {msg_id} {msg_name}:\n{msg_data}")
+                    tracing::error!("{ty_name}: 0x{msg_id:08x} {msg_name}:\n{msg_data}")
                 } else if message_severity.contains(SevFlags::WARNING) {
-                    tracing::warn!("{ty_name}: {msg_id} {msg_name}:\n{msg_data}")
+                    tracing::warn!("{ty_name}: 0x{msg_id:08x} {msg_name}:\n{msg_data}")
                 } else if message_severity.contains(SevFlags::INFO) {
-                    tracing::info!("{ty_name}: {msg_id} {msg_name}:\n{msg_data}")
+                    tracing::info!("{ty_name}: 0x{msg_id:08x} {msg_name}:\n{msg_data}")
                 } else if message_severity.contains(SevFlags::VERBOSE) {
-                    tracing::trace!("{ty_name}: {msg_id} {msg_name}:\n{msg_data}")
+                    tracing::trace!("{ty_name}: 0x{msg_id:08x} {msg_name}:\n{msg_data}")
                 }
 
                 ash::vk::FALSE
@@ -706,17 +950,22 @@ mod rvk {
             }
         }
     }
+
+    /// Functionality related to the surface. Exists for scoping reasons
     mod surface {
         use std::{fmt::Debug, sync::Arc};
 
-        use ash::vk::SurfaceKHR;
+        use ash::{
+            prelude::VkResult,
+            vk::{self, Extent2D, PresentModeKHR, SurfaceFormatKHR, SurfaceKHR},
+        };
         use thiserror::Error;
         use winit::{
             raw_window_handle::{HasDisplayHandle, HasWindowHandle},
             window::Window,
         };
 
-        use super::Instance;
+        use super::{Device, Instance};
 
         /// Represents a VkSurfaceKHR.
         pub(crate) struct Surface {
@@ -729,7 +978,7 @@ mod rvk {
             pub(super) parent_instance: Arc<Instance>,
             /// Reference counted pointer to the underlying window. Here for RAII
             /// purposes as Window must be destroyed *after* surface
-            _parent_window: Arc<Window>,
+            parent_window: Arc<Window>,
         }
 
         impl Debug for Surface {
@@ -738,7 +987,7 @@ mod rvk {
                     .field("surface_instance", &"...")
                     .field("surface", &self.surface)
                     .field("_parent_instance", &self.parent_instance)
-                    .field("_parent_window", &self._parent_window)
+                    .field("_parent_window", &self.parent_window)
                     .finish()
             }
         }
@@ -771,6 +1020,86 @@ mod rvk {
         }
 
         impl Surface {
+            /// Get the extent of the surface in Vulkan terms
+            pub fn get_surface_extent(&self) -> Extent2D {
+                let inner_size = self.parent_window.inner_size();
+                Extent2D {
+                    width: inner_size.width,
+                    height: inner_size.height,
+                }
+            }
+
+            /// Get the formats associated with this surface on this device.
+            ///
+            /// # SAFETY
+            ///
+            /// Surface and Device are from the same instance
+            pub unsafe fn get_formats_unsafe(
+                &self,
+                device: &Device,
+            ) -> VkResult<Vec<SurfaceFormatKHR>> {
+                //SAFETY: We pass the responsibility for the Device being from
+                //the same instance as us to the caller
+                unsafe {
+                    self.surface_instance
+                        .get_physical_device_surface_formats(device.phys_dev, self.surface)
+                }
+            }
+
+            /// Gets the present modes associated with this surface on this device
+            ///
+            /// # SAFETY
+            ///
+            /// Surface and Device are from the same instance
+            pub unsafe fn get_present_modes_unsafe(
+                &self,
+                device: &Device,
+            ) -> VkResult<Vec<PresentModeKHR>> {
+                //SAFETY: We pass the responsibility for the Device being from
+                //the same instance as us to the caller
+                unsafe {
+                    self.surface_instance
+                        .get_physical_device_surface_present_modes(device.phys_dev, self.surface)
+                }
+            }
+
+            /// Checks if queue_family_index associated with the physical_device
+            /// supports presenting to this Surface.
+            ///
+            /// # SAFETY
+            ///
+            /// Surface and Device are from the same instance
+            pub unsafe fn _get_support_unsafe(
+                &self,
+                device: &Device,
+                queue_family_index: u32,
+            ) -> VkResult<bool> {
+                //SAFETY: Surface and Device are from the same instance
+                unsafe {
+                    self.surface_instance.get_physical_device_surface_support(
+                        device._get_phys_dev(),
+                        queue_family_index,
+                        self.surface,
+                    )
+                }
+            }
+
+            /// Get the capabilities associated with this surface on this device.
+            ///
+            /// # SAFETY
+            ///
+            /// Surface and Device are from the same instance
+            pub unsafe fn get_capabilities_unsafe(
+                &self,
+                device: &Device,
+            ) -> VkResult<vk::SurfaceCapabilitiesKHR> {
+                //SAFETY: We pass the responsibility for the Device being from
+                //the same instance as us to the caller
+                unsafe {
+                    self.surface_instance
+                        .get_physical_device_surface_capabilities(device.phys_dev, self.surface)
+                }
+            }
             /// Uses a winit Window in order to create a surface
             pub(crate) fn from_winit_window(
                 win: &Arc<Window>,
@@ -778,9 +1107,9 @@ mod rvk {
             ) -> Result<Self, SurfaceCreateError> {
                 let surface_instance =
                     ash::khr::surface::Instance::new(&instance.entry, &instance.instance);
-                //SAFETY: Passing a valid window and display handle. Enforces the
-                //parent/child relationship between the surface and the instance by
-                //holding onto an Arc to the instance
+                //SAFETY: Passing a valid window and display handle. Enforces
+                //the parent/child relationship between the surface and the
+                //instance/window by holding onto an Arc to the instance/window
                 let surface = unsafe {
                     ash_window::create_surface(
                         &instance.entry,
@@ -799,18 +1128,23 @@ mod rvk {
                     surface_instance,
                     surface,
                     parent_instance: instance.clone(),
-                    _parent_window: win.clone(),
+                    parent_window: win.clone(),
                 })
             }
         }
     }
 
+    /// implementation related to device. Exists for scoping reasons
     mod device {
         use std::{fmt::Debug, sync::Arc};
 
-        use ash::vk::{
-            self, DeviceCreateInfo, DeviceQueueCreateInfo, PhysicalDeviceFeatures2,
-            PhysicalDeviceVulkan12Features, PhysicalDeviceVulkan13Features, QueueFlags,
+        use ash::{
+            prelude::VkResult,
+            vk::{
+                self, DeviceCreateInfo, DeviceQueueCreateInfo, ImageView, ImageViewCreateInfo,
+                PhysicalDeviceFeatures2, PhysicalDeviceVulkan12Features,
+                PhysicalDeviceVulkan13Features, QueueFlags,
+            },
         };
         use thiserror::Error;
 
@@ -818,14 +1152,23 @@ mod rvk {
 
         use super::{Instance, Surface};
 
+        //TODO: Support separate present and graphics queue
         /// Represents a VkDevice
         pub(crate) struct Device {
             /// Parent for RAII purposes
-            parent: Arc<Instance>,
+            pub(super) parent: Arc<Instance>,
             ///Underlying VkDevice
-            device: ash::Device,
-            /// A set of function pointers for interacting with the DebugMessenger in parent
-            debug_utils_fps: Option<ash::ext::debug_utils::Device>,
+            pub(super) device: ash::Device,
+            /// A set of function pointers for interacting with the
+            /// DebugMessenger in parent
+            pub(super) debug_utils_fps: Option<ash::ext::debug_utils::Device>,
+            /// Handle to the physical device. Need to keep it around for some
+            /// stuff
+            pub(super) phys_dev: vk::PhysicalDevice,
+            /// Handle to the queue we will submit graphics to
+            _graphics_queue: vk::Queue,
+            /// Index of the graphics queue family
+            _graphics_queue_index: u32,
         }
 
         impl Debug for Device {
@@ -845,6 +1188,7 @@ mod rvk {
             }
         }
 
+        /// Errors that can pop up when creating devices
         #[derive(Error, Debug)]
         pub enum DeviceCreateError {
             #[error("Unknown vulkan error {0}")]
@@ -854,8 +1198,8 @@ mod rvk {
             /// You passed in a Surface that wasn't created from Instance
             InstanceSurfaceMismatch,
             #[error("No suitable device found")]
-            /// When we went to scan for devices, we didn't find one that fulfilled our
-            /// requirements
+            /// When we went to scan for devices, we didn't find one that
+            /// fulfilled our requirements
             NoSuitableDevice,
         }
 
@@ -867,6 +1211,8 @@ mod rvk {
 
         #[derive(Debug)]
         #[expect(dead_code, reason = "We aren't using all of these members yet")]
+        #[expect(clippy::missing_docs_in_private_items, reason = "Christ this is a lot")]
+        /// Physical device that we've evaluated
         struct ScoredPhysDev<'a> {
             phys_dev: vk::PhysicalDevice,
             score: u32,
@@ -885,6 +1231,36 @@ mod rvk {
             formats: Vec<vk::SurfaceFormatKHR>,
         }
         impl Device {
+            ///Creates a raw image view. Generally for internal use.
+            ///
+            /// SAFETY: ci.image must be associated with this device. Otherwise
+            /// see [vkCreateImageView](https://registry.khronos.org/vulkan/specs/latest/man/html/vkCreateImageView.html)
+            pub(crate) unsafe fn create_image_view_raw(
+                &self,
+                ci: &ImageViewCreateInfo,
+            ) -> VkResult<ash::vk::ImageView> {
+                //SAFETY: From preconditions of this unsafe function
+                unsafe { self.device.create_image_view(ci, None) }
+            }
+
+            ///Destroys a raw image view. Generally for internal use.
+            ///
+            /// SAFETY: image_view must be from self. Otherwise see
+            /// [vcDestroyImageView](https://registry.khronos.org/vulkan/specs/latest/man/html/vkDestroyImageView.html)
+            pub(crate) unsafe fn destroy_image_view_raw(&self, image_view: ImageView) {
+                //SAFETY: Inherited from preconditions of this unsafe function
+                unsafe { self.device.destroy_image_view(image_view, None) };
+            }
+            ///Get the instance that was used to create this device
+            pub(crate) fn parent_instance(&self) -> &Arc<Instance> {
+                &self.parent
+            }
+
+            ///Get the inner ash device for passing into other functions
+            pub(super) fn inner(&self) -> &ash::Device {
+                &self.device
+            }
+
             /// Create a device that is compatible with the surface
             pub(crate) fn create_compatible(
                 instance: &Arc<Instance>,
@@ -898,7 +1274,8 @@ mod rvk {
                 let phys_devs = instance.enumerate_physical_devices()?;
                 let scored_phys_dev: ScoredPhysDev =
                     match phys_devs.into_iter().fold(None, |best_so_far, current| {
-                        // SAFETY: current is a VkPhysicalDevice derived from instance
+                        // SAFETY: current is a VkPhysicalDevice derived from
+                        // instance
                         let ext_props = match unsafe {
                             instance
                                 .instance
@@ -918,14 +1295,16 @@ mod rvk {
                             .push_next(&mut props_12)
                             .push_next(&mut props_13);
 
-                        // SAFETY: current is derived from instance. Valid current_dev_props
+                        // SAFETY: current is derived from instance. Valid
+                        // current_dev_props
                         unsafe {
                             instance
                                 .instance
                                 .get_physical_device_properties2(current, &mut props)
                         };
 
-                        //Early return when this doesn't support our min api version
+                        //Early return when this doesn't support our min api
+                        //version
                         if props.properties.api_version < min_api_version.to_vk_version() {
                             return best_so_far;
                         }
@@ -941,7 +1320,8 @@ mod rvk {
                             );
                         }
 
-                        // SAFETY: Surface and current are both derived from instance
+                        // SAFETY: Surface and current are both derived from
+                        // instance
                         let surface_capabilities = unsafe {
                             surface
                                 .surface_instance
@@ -956,7 +1336,8 @@ mod rvk {
                         }
                         .ok()?;
 
-                        // SAFETY: current and surface are derived from the same instance
+                        // SAFETY: current and surface are derived from the same
+                        // instance
                         let present_modes = unsafe {
                             surface
                                 .surface_instance
@@ -987,14 +1368,16 @@ mod rvk {
                         let features_11 = features_11;
                         let features_12 = features_12;
                         let features_13 = features_13;
-                        //SAFETY: Basically handled by ash doing the memory management for us
+                        //SAFETY: Basically handled by ash doing the memory
+                        //management for us
                         let qfis = unsafe {
                             instance
                                 .instance
                                 .get_physical_device_queue_family_properties(current)
                         };
                         let graphics_qfi = qfis.iter().cloned().enumerate().find(|(qfi, props)| {
-                            // SAFETY: current and surface come from the same instance
+                            // SAFETY: current and surface come from the same
+                            // instance
                             let present_support = unsafe {
                                 surface
                                     .surface_instance
@@ -1016,8 +1399,8 @@ mod rvk {
                             .clone()
                             .any(|ext_name| ext_name.eq(ash::khr::swapchain::NAME));
 
-                        //Check for mandatory features. This is currently a sample from
-                        //vkguide.
+                        //Check for mandatory features. This is currently a
+                        //sample from vkguide.
                         if features_13.synchronization2 == vk::FALSE
                             || features_13.dynamic_rendering == vk::FALSE
                             || features_12.descriptor_indexing == vk::FALSE
@@ -1099,11 +1482,23 @@ mod rvk {
                     .is_some()
                     .then(|| ash::ext::debug_utils::Device::new(&instance.instance, &device));
 
+                //SAFETY: graphics_qfi was passed in for one of the QCIs. Queue index is 0
+                let graphics_queue =
+                    unsafe { device.get_device_queue(scored_phys_dev.graphics_qfi, 0) };
+
                 Ok(Self {
                     parent: instance.clone(),
                     device,
                     debug_utils_fps,
+                    phys_dev: scored_phys_dev.phys_dev,
+                    _graphics_queue: graphics_queue,
+                    _graphics_queue_index: scored_phys_dev.graphics_qfi,
                 })
+            }
+
+            /// Returns a handle to the associated physical device
+            pub(crate) fn _get_phys_dev(&self) -> vk::PhysicalDevice {
+                self.phys_dev
             }
         }
 
