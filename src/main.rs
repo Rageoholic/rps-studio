@@ -12,18 +12,27 @@
 
 /// Current Top Level crate for our app. Will break up in future
 use core::fmt::Debug;
-use std::{fs::File, path::PathBuf, sync::Arc};
+use std::{
+    fs::File,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use app_dirs2::AppInfo;
 
 use clap::Parser;
+use naga::{
+    back::spv::{self, PipelineOptions, SourceLanguage},
+    front::glsl::Options,
+    valid::{ShaderStages, SubgroupOperationSet},
+    ShaderStage,
+};
+use rvk::{Device, Instance, Surface, Swapchain, VulkanDebugLevel};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use winit::{
     application::ApplicationHandler, event::WindowEvent, event_loop,
     raw_window_handle::HasDisplayHandle, window::Window,
 };
-
-use rvk::{Device, Instance, Surface, Swapchain, VulkanDebugLevel};
 
 /// Our app info for app_dirs2
 const APP_INFO: AppInfo = AppInfo {
@@ -189,7 +198,10 @@ impl AppRunner {
             })
     }
 }
-
+///Vertex shader source
+const VERT_SHADER_SOURCE: &str = include_str!("shader.vert");
+///Fragment shader source
+const FRAG_SHADER_SOURCE: &str = include_str!("shader.frag");
 impl ApplicationHandler for AppRunner {
     fn resumed(&mut self, event_loop: &event_loop::ActiveEventLoop) {
         if let Some(UninitState { instance }) = self.take_uninit() {
@@ -227,6 +239,109 @@ impl ApplicationHandler for AppRunner {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!("Could not create swapchain: Error {}", e);
+                    event_loop.exit();
+                    return;
+                }
+            };
+
+            let mut spv_writer = match spv::Writer::new(&spv::Options {
+                lang_version: (1, 6),
+                ..Default::default()
+            }) {
+                Ok(writer) => writer,
+                Err(e) => {
+                    tracing::error!("Couldn't create SPV backend {}", e);
+                    event_loop.exit();
+                    return;
+                }
+            };
+            let vert_shader_mod = match naga::front::glsl::Frontend::default()
+                .parse(&Options::from(ShaderStage::Vertex), VERT_SHADER_SOURCE)
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!(
+                        "Could not create vertex shader due to parsing error.\n{}",
+                        e.emit_to_string("src/shader.vert")
+                    );
+                    event_loop.exit();
+                    return;
+                }
+            };
+
+            let vert_shader_mod_info = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .subgroup_stages(ShaderStages::VERTEX)
+            .subgroup_operations(SubgroupOperationSet::all())
+            .validate(&vert_shader_mod)
+            .unwrap();
+
+            let mut vert_spv_bytes = Vec::new();
+            match spv_writer.write(
+                &vert_shader_mod,
+                &vert_shader_mod_info,
+                Some(&PipelineOptions {
+                    shader_stage: ShaderStage::Vertex,
+                    entry_point: "main".into(),
+                }),
+                &Some(spv::DebugInfo {
+                    source_code: VERT_SHADER_SOURCE,
+                    file_name: Path::new("src/shader.frag"),
+                    language: SourceLanguage::GLSL,
+                }),
+                &mut vert_spv_bytes,
+            ) {
+                Ok(spv) => spv,
+                Err(e) => {
+                    tracing::error!("Couldn't compile shader: {}", e);
+                    event_loop.exit();
+                    return;
+                }
+            };
+
+            let frag_shader_mod = match naga::front::glsl::Frontend::default()
+                .parse(&Options::from(ShaderStage::Fragment), FRAG_SHADER_SOURCE)
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!(
+                        "Could not create vertex shader due to parsing error.\n{}",
+                        e.emit_to_string("src/shader.frag")
+                    );
+                    event_loop.exit();
+                    return;
+                }
+            };
+
+            let frag_shader_mod_info = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .subgroup_stages(ShaderStages::FRAGMENT)
+            .subgroup_operations(SubgroupOperationSet::all())
+            .validate(&frag_shader_mod)
+            .unwrap();
+
+            let mut frag_spv_bytes = Vec::new();
+            match spv_writer.write(
+                &frag_shader_mod,
+                &frag_shader_mod_info,
+                Some(&PipelineOptions {
+                    shader_stage: ShaderStage::Fragment,
+                    entry_point: "main".into(),
+                }),
+                &Some(spv::DebugInfo {
+                    source_code: VERT_SHADER_SOURCE,
+                    file_name: Path::new("src/shader.frag"),
+                    language: SourceLanguage::GLSL,
+                }),
+                &mut frag_spv_bytes,
+            ) {
+                Ok(spv) => spv,
+                Err(e) => {
+                    tracing::error!("Couldn't compile frag shader: {}", e);
                     event_loop.exit();
                     return;
                 }
