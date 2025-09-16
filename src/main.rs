@@ -31,7 +31,7 @@ use winit::{
 use rvk::{
     device::Device,
     instance::{Instance, VulkanDebugLevel},
-    pipeline::PipelineLayout,
+    pipeline::{Pipeline, PipelineLayout, RenderPass},
     shader::{ShaderCompiler, ShaderDebugLevel, ShaderOptLevel, ShaderType},
     surface::Surface,
     swapchain::Swapchain,
@@ -55,8 +55,8 @@ struct RunningState {
     /// handle to the GPU device
     device: Arc<Device>,
     /// A swapchain we are currently using
-    _swapchain: Swapchain,
-    pipeline_layout: PipelineLayout,
+    _swapchain: Arc<Swapchain>,
+    pipeline_layout: Arc<PipelineLayout>,
 }
 
 /// State of the application while suspended
@@ -68,7 +68,7 @@ struct SuspendedState {
     instance: Arc<Instance>,
     /// handle to GPU device
     device: Arc<Device>,
-    pipeline_layout: PipelineLayout,
+    pipeline_layout: Arc<PipelineLayout>,
 }
 
 /// State of the app before initialization
@@ -246,14 +246,14 @@ impl ApplicationHandler for AppRunner {
             let frag_shader_source_loc: PathBuf =
                 [src_dir, Path::new("shader.frag")].iter().collect();
 
-            let swapchain = match Swapchain::create(&device, &surface) {
+            let swapchain = Arc::new(match Swapchain::create(&device, &surface) {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!("Could not create swapchain: Error {}", e);
                     event_loop.exit();
                     return;
                 }
-            };
+            });
 
             let mut shader_compiler =
                 match ShaderCompiler::new(&device, ShaderDebugLevel::Full, ShaderOptLevel::None) {
@@ -265,35 +265,63 @@ impl ApplicationHandler for AppRunner {
                     }
                 };
 
-            let _vert_shader = match shader_compiler.compile_shader(
-                VERT_SHADER_SOURCE,
-                ShaderType::Vertex,
-                Some(vert_shader_source_loc).as_deref(),
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("Could not create vert shader: Error {}", e);
-                    event_loop.exit();
-                    return;
-                }
-            };
+            let vert_shader = Arc::new(
+                match shader_compiler.compile_shader(
+                    VERT_SHADER_SOURCE,
+                    ShaderType::Vertex,
+                    Some(vert_shader_source_loc).as_deref(),
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!("Could not create vert shader: Error {}", e);
+                        event_loop.exit();
+                        return;
+                    }
+                },
+            );
 
-            let _frag_shader = match shader_compiler.compile_shader(
-                FRAG_SHADER_SOURCE,
-                ShaderType::Fragment,
-                Some(frag_shader_source_loc).as_deref(),
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("Could not create frag shader: Error {}", e);
-                    event_loop.exit();
-                    return;
-                }
-            };
-            let _pipeline_layout = match PipelineLayout::new(&device) {
+            let frag_shader = Arc::new(
+                match shader_compiler.compile_shader(
+                    FRAG_SHADER_SOURCE,
+                    ShaderType::Fragment,
+                    Some(frag_shader_source_loc).as_deref(),
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!("Could not create frag shader: Error {}", e);
+                        event_loop.exit();
+                        return;
+                    }
+                },
+            );
+            let pipeline_layout = Arc::new(match PipelineLayout::new(&device) {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::error!("Could not create pipeline layout: Error {}", e);
+                    event_loop.exit();
+                    return;
+                }
+            });
+
+            let render_pass = Arc::new(match RenderPass::new(&device, &swapchain) {
+                Ok(rp) => rp,
+                Err(e) => {
+                    tracing::error!("Could not create render pass: Error {}", e);
+                    event_loop.exit();
+                    return;
+                }
+            });
+
+            let pipeline = match Pipeline::new(
+                &device,
+                &pipeline_layout,
+                &render_pass,
+                &vert_shader,
+                &frag_shader,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!("Could not create pipeline: Error {}", e);
                     event_loop.exit();
                     return;
                 }
@@ -307,7 +335,7 @@ impl ApplicationHandler for AppRunner {
                 _surface: surface,
                 device,
                 _swapchain: swapchain,
-                pipeline_layout: _pipeline_layout,
+                pipeline_layout,
             }))
         } else if let Some(SuspendedState {
             win,
@@ -324,14 +352,14 @@ impl ApplicationHandler for AppRunner {
                     return;
                 }
             };
-            let swapchain = match Swapchain::create(&device, &surface) {
+            let swapchain = Arc::new(match Swapchain::create(&device, &surface) {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!("Could not recreate swapchain: Error {}", e);
                     event_loop.exit();
                     return;
                 }
-            };
+            });
             self.app_state = Some(AppState::Running(RunningState {
                 pipeline_layout,
                 win,

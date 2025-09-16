@@ -2,8 +2,10 @@
 pub mod pipeline {
     use std::sync::Arc;
 
-    use ash::vk;
+    use ash::vk::{self};
     use thiserror::Error;
+
+    use crate::rvk::{shader::Shader, swapchain::Swapchain};
 
     use super::device::Device;
 
@@ -48,6 +50,194 @@ pub mod pipeline {
             })
         }
     }
+
+    #[derive(Debug)]
+    pub struct Pipeline {
+        parent: Arc<Device>,
+        _render_pass: Arc<RenderPass>,
+        _layout: Arc<PipelineLayout>,
+        _vert_shader: Arc<Shader>,
+        _frag_shader: Arc<Shader>,
+        pipeline: vk::Pipeline,
+    }
+
+    #[derive(Debug, Error)]
+    pub enum PipelineCreateError {
+        #[error("You passed in parameters that aren't all from the same vulkan device")]
+        MismatchedDevices,
+        #[error("Unknown vk error: {0}")]
+        UnknownVk(vk::Result),
+    }
+
+    impl Pipeline {
+        pub fn new(
+            parent: &Arc<Device>,
+            layout: &Arc<PipelineLayout>,
+            render_pass: &Arc<RenderPass>,
+            vert_shader: &Arc<Shader>,
+            frag_shader: &Arc<Shader>,
+        ) -> Result<Self, PipelineCreateError> {
+            use PipelineCreateError as Error;
+            let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+            let dynamic_state =
+                vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+            //TODO: parse vertex state passed to us
+            let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::default();
+            let input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo::default()
+                .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+            let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+                .viewport_count(1)
+                .scissor_count(1);
+            let rasterization_state = vk::PipelineRasterizationStateCreateInfo::default()
+                .depth_clamp_enable(false)
+                .rasterizer_discard_enable(false)
+                .polygon_mode(vk::PolygonMode::FILL)
+                .line_width(1.0)
+                .cull_mode(vk::CullModeFlags::BACK)
+                .front_face(vk::FrontFace::CLOCKWISE)
+                .depth_bias_enable(false);
+            let multisample_state = vk::PipelineMultisampleStateCreateInfo::default()
+                .sample_shading_enable(false)
+                .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+            let color_blend_states = [vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::RGBA)
+                .blend_enable(false)];
+            let color_blend_ci = vk::PipelineColorBlendStateCreateInfo::default()
+                .logic_op_enable(false)
+                .attachments(&color_blend_states);
+
+            if layout.parent != *parent || *parent != render_pass.parent_device {
+                Err(Error::MismatchedDevices)?
+            }
+
+            let stages = [
+                vk::PipelineShaderStageCreateInfo::default()
+                    .module((vert_shader).inner())
+                    .stage(vk::ShaderStageFlags::VERTEX)
+                    .name(c"main"),
+                vk::PipelineShaderStageCreateInfo::default()
+                    .module(frag_shader.inner())
+                    .stage(vk::ShaderStageFlags::FRAGMENT)
+                    .name(c"main"),
+            ];
+
+            let pipeline_ci = vk::GraphicsPipelineCreateInfo::default()
+                .stages(&stages)
+                .vertex_input_state(&vertex_input_state)
+                .input_assembly_state(&input_assembly_state)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&rasterization_state)
+                .multisample_state(&multisample_state)
+                .color_blend_state(&color_blend_ci)
+                .dynamic_state(&dynamic_state)
+                .layout(layout.inner)
+                .render_pass(render_pass.render_pass)
+                .subpass(0);
+
+            //SAFETY: valid ci
+            let pipeline = unsafe {
+                parent.inner().create_graphics_pipelines(
+                    vk::PipelineCache::null(),
+                    &[pipeline_ci],
+                    None,
+                )
+            }
+            .map_err(|e| {
+                for p in e.0 {
+                    //SAFETY: created p from parent
+                    unsafe { parent.inner().destroy_pipeline(p, None) };
+                }
+                Error::UnknownVk(e.1)
+            })?;
+
+            Ok(Self {
+                parent: parent.clone(),
+                _layout: layout.clone(),
+                _render_pass: render_pass.clone(),
+                _vert_shader: vert_shader.clone(),
+                _frag_shader: frag_shader.clone(),
+                pipeline: pipeline[0],
+            })
+        }
+    }
+
+    impl Drop for Pipeline {
+        fn drop(&mut self) {
+            //SAFETY: pipeline is from parent
+            unsafe { self.parent.inner().destroy_pipeline(self.pipeline, None) };
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct RenderPass {
+        parent_device: Arc<Device>,
+        parent_swapchain: Arc<Swapchain>,
+        render_pass: vk::RenderPass,
+    }
+    impl PartialEq for RenderPass {
+        fn eq(&self, other: &Self) -> bool {
+            self.parent_device == other.parent_device
+                && self.parent_swapchain == other.parent_swapchain
+                && self.render_pass == other.render_pass
+        }
+    }
+
+    impl Eq for RenderPass {}
+
+    #[derive(Error, Debug)]
+    pub enum RenderPassCreateError {
+        #[error("Unknown vk error {0}")]
+        UnknownVulkan(vk::Result),
+    }
+    impl RenderPass {
+        pub fn new(
+            parent_device: &Arc<Device>,
+            parent_swapchain: &Arc<Swapchain>,
+        ) -> Result<Self, RenderPassCreateError> {
+            let color_attachment_format = parent_swapchain.get_color_format();
+            let color_attachments = [vk::AttachmentDescription::default()
+                .format(color_attachment_format)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .samples(vk::SampleCountFlags::TYPE_1)];
+
+            let color_attachment_refs = [vk::AttachmentReference::default()
+                .attachment(0)
+                .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+            let subpasses =
+                [vk::SubpassDescription::default().color_attachments(&color_attachment_refs)];
+            let render_pass_ci = vk::RenderPassCreateInfo::default()
+                .attachments(&color_attachments)
+                .subpasses(&subpasses);
+
+            // SAFETY: Valid CI
+            let render_pass = unsafe {
+                parent_device
+                    .inner()
+                    .create_render_pass(&render_pass_ci, None)
+            }
+            .map_err(RenderPassCreateError::UnknownVulkan)?;
+            Ok(Self {
+                parent_device: parent_device.clone(),
+                parent_swapchain: parent_swapchain.clone(),
+                render_pass,
+            })
+        }
+    }
+    impl Drop for RenderPass {
+        fn drop(&mut self) {
+            //SAFETY: We made render_pass with parent_device
+            unsafe {
+                self.parent_device
+                    .inner()
+                    .destroy_render_pass(self.render_pass, None);
+            }
+        }
+    }
 }
 
 ///Functionality related to swapchains
@@ -55,7 +245,7 @@ pub mod swapchain {
     use std::{fmt::Debug, sync::Arc};
 
     use ash::vk::{
-        ColorSpaceKHR, ComponentMapping, CompositeAlphaFlagsKHR, Extent2D, Format, Image,
+        self, ColorSpaceKHR, ComponentMapping, CompositeAlphaFlagsKHR, Extent2D, Format, Image,
         ImageAspectFlags, ImageSubresourceRange, ImageUsageFlags, ImageView, ImageViewCreateInfo,
         ImageViewType, PresentModeKHR, SharingMode, SurfaceTransformFlagsKHR,
         SwapchainCreateInfoKHR, SwapchainKHR,
@@ -77,6 +267,15 @@ pub mod swapchain {
         _images: Vec<Image>,
         /// Image views associated with above images
         image_views: Vec<ImageView>,
+        _surface_format: ash::vk::SurfaceFormatKHR,
+    }
+
+    impl PartialEq for Swapchain {
+        fn eq(&self, other: &Self) -> bool {
+            self.parent_device == other.parent_device
+                && self.parent_surface == other.parent_surface
+                && self.swapchain == other.swapchain
+        }
     }
 
     #[derive(thiserror::Error, Debug)]
@@ -215,7 +414,12 @@ pub mod swapchain {
                 swapchain_device,
                 _images: images,
                 image_views,
+                _surface_format: surface_format,
             })
+        }
+
+        pub(crate) fn get_color_format(&self) -> vk::Format {
+            self._surface_format.format
         }
     }
 
@@ -270,6 +474,14 @@ pub mod instance {
         /// Represents a VkDebugUtilsMessengerEXT that may or may not be present
         debug_messenger: Option<DebugMessenger>,
     }
+
+    impl PartialEq for Instance {
+        fn eq(&self, other: &Self) -> bool {
+            self.instance.handle() == other.instance.handle()
+                && self.debug_messenger == other.debug_messenger
+        }
+    }
+    impl Eq for Instance {}
     impl Drop for Instance {
         fn drop(&mut self) {
             if let Some(dm) = self.debug_messenger.take() {
@@ -513,6 +725,12 @@ pub mod instance {
         /// The loaded extension function pointers and stuff
         debug_utils_instance: ash::ext::debug_utils::Instance,
     }
+    impl PartialEq for DebugMessenger {
+        fn eq(&self, other: &Self) -> bool {
+            self.debug_messenger == other.debug_messenger
+        }
+    }
+    impl Eq for DebugMessenger {}
 
     #[derive(
         Debug,
@@ -591,6 +809,15 @@ pub mod surface {
         /// purposes as Window must be destroyed *after* surface
         parent_window: Arc<Window>,
     }
+
+    impl PartialEq for Surface {
+        fn eq(&self, other: &Self) -> bool {
+            self.surface == other.surface
+                && self.parent_instance == other.parent_instance
+                && self.parent_window.id() == other.parent_window.id()
+        }
+    }
+    impl Eq for Surface {}
 
     impl Debug for Surface {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -789,6 +1016,17 @@ pub mod device {
         _graphics_queue: vk::Queue,
         /// Index of the graphics queue family
         _graphics_queue_index: u32,
+    }
+
+    impl PartialEq for Device {
+        fn eq(&self, other: &Self) -> bool {
+            let parent_eq = self.parent == other.parent;
+            let handle_eq = self.device.handle() == other.device.handle();
+            let phys_dev_eq = self.phys_dev == other.phys_dev;
+            let gq_eq = self._graphics_queue == other._graphics_queue;
+            let gqi_eq = self._graphics_queue_index == other._graphics_queue_index;
+            parent_eq && handle_eq && phys_dev_eq && gq_eq && gqi_eq
+        }
     }
 
     impl Debug for Device {
@@ -1179,6 +1417,11 @@ pub mod shader {
         vk_shader: vk::ShaderModule,
         /// Device we came from
         parent_device: Arc<Device>,
+    }
+    impl Shader {
+        pub(crate) fn inner(&self) -> vk::ShaderModule {
+            self.vk_shader
+        }
     }
 
     #[derive(Debug, Error)]
