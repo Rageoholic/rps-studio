@@ -1,199 +1,251 @@
-use std::{fmt::Debug, sync::Arc};
+///Pipeline related functionality
+pub mod pipeline {
+    use std::sync::Arc;
 
-use ash::vk::{
-    ColorSpaceKHR, ComponentMapping, CompositeAlphaFlagsKHR, Extent2D, Format, Image,
-    ImageAspectFlags, ImageSubresourceRange, ImageUsageFlags, ImageView, ImageViewCreateInfo,
-    ImageViewType, PresentModeKHR, SharingMode, SurfaceTransformFlagsKHR, SwapchainCreateInfoKHR,
-    SwapchainKHR,
-};
-pub(crate) use device::Device;
-pub(crate) use instance::{Instance, VulkanDebugLevel};
+    use ash::vk;
+    use thiserror::Error;
 
-pub(crate) use surface::Surface;
+    use super::device::Device;
 
-/// Thing that we render to
-pub struct Swapchain {
-    /// Device that we were made with
-    parent_device: Arc<Device>,
-    /// Surface that we were made with
-    parent_surface: Arc<Surface>,
-    /// Loaded extension function pointers
-    swapchain_device: ash::khr::swapchain::Device,
-    /// Actual handle to the surface
-    swapchain: SwapchainKHR,
-    /// Images associated with the swapchain
-    _images: Vec<Image>,
-    /// Image views associated with above images
-    image_views: Vec<ImageView>,
-}
-
-#[derive(thiserror::Error, Debug)]
-/// Errors that pop up when we create a swapchain
-pub enum SwapchainCreateError {
-    /// We don't know what went wrong but vulkan did it. Effectively the
-    /// default shrug answer
-    #[error("Unknown Vulkan error {0}")]
-    UnknownVulkan(ash::vk::Result),
-    /// You passed in a surface and device that are not derived from the
-    /// same instance
-    #[error("Incompatible parameters (device and surface are not from same instance)")]
-    IncompatibleParameters,
-    /// For some reason we can't pick a format. So we can't create a swapchain. Should basically
-    /// never happen
-    #[error("No compatible format found")]
-    NoCompatibleFormat,
-}
-impl From<ash::vk::Result> for SwapchainCreateError {
-    fn from(value: ash::vk::Result) -> Self {
-        Self::UnknownVulkan(value)
+    ///Represents an RAII vk::PipelineLayout
+    #[derive(Debug)]
+    pub struct PipelineLayout {
+        parent: Arc<Device>,
+        inner: vk::PipelineLayout,
     }
-}
 
-impl Swapchain {
-    /// Create a swapchain from this device and surface. Might wanna
-    /// make some optional parameters to configure? But rn this is
-    /// wrapping how *I* set up a swapchain
-    pub(crate) fn create(
-        device: &Arc<Device>,
-        surface: &Arc<Surface>,
-    ) -> Result<Swapchain, SwapchainCreateError> {
-        if device.get_parent().raw_handle() != surface.parent_instance().raw_handle() {
-            return Err(SwapchainCreateError::IncompatibleParameters);
+    impl Drop for PipelineLayout {
+        fn drop(&mut self) {
+            // SAFETY: inner was derived from parent
+            unsafe {
+                self.parent
+                    .inner()
+                    .destroy_pipeline_layout(self.inner, None)
+            };
         }
-        let swapchain_device =
-            ash::khr::swapchain::Device::new(device.parent_instance().inner(), device.inner());
+    }
 
-        //SAFETY: surface and device are derived from the same instance
-        let (surface_capabilities, surface_formats, present_modes) = unsafe {
-            (
-                surface.get_capabilities_unsafe(device)?,
-                surface.get_formats_unsafe(device)?,
-                surface.get_present_modes_unsafe(device)?,
-            )
-        };
+    #[derive(Debug, Error)]
+    pub enum PipelineLayoutCreateError {
+        #[error("Unknown vulkan error {0}")]
+        UnknownVulkan(vk::Result),
+    }
 
-        let present_mode = present_modes
-            .iter()
-            .find(|pm| **pm == PresentModeKHR::MAILBOX)
-            .copied()
-            .unwrap_or(PresentModeKHR::FIFO);
+    impl PipelineLayout {
+        pub fn new(device: &Arc<Device>) -> Result<Self, PipelineLayoutCreateError> {
+            let pipeline_layout_ci = vk::PipelineLayoutCreateInfo::default();
 
-        let surface_format = surface_formats
-            .iter()
-            .find(|format| {
-                format.color_space == ColorSpaceKHR::SRGB_NONLINEAR
-                    && format.format == Format::B8G8R8A8_SRGB
-            })
-            .copied()
-            .or(surface_formats.first().copied())
-            .ok_or(SwapchainCreateError::NoCompatibleFormat)?;
-
-        let swapchain_extent = if surface_capabilities.current_extent.width != u32::MAX {
-            surface_capabilities.current_extent
-        } else {
-            let surface_extent = surface.get_surface_extent();
-
-            Extent2D {
-                width: surface_extent.width.clamp(
-                    surface_capabilities.min_image_extent.width,
-                    surface_capabilities.max_image_extent.height,
-                ),
-                height: surface_extent.height.clamp(
-                    surface_capabilities.min_image_extent.height,
-                    surface_capabilities.max_image_extent.height,
-                ),
+            // SAFETY: we're passing in a valid ci
+            let pipeline_layout = unsafe {
+                device
+                    .inner()
+                    .create_pipeline_layout(&pipeline_layout_ci, None)
             }
-        };
-        let default_image_count = surface_capabilities.min_image_count + 1;
-        let max_image_count = surface_capabilities.max_image_count;
-        let requested_image_count = if max_image_count != 0 && max_image_count < default_image_count
-        {
-            max_image_count
-        } else {
-            default_image_count
-        };
-
-        //TODO: Different image sharing mode?
-        let ci = SwapchainCreateInfoKHR::default()
-            .present_mode(present_mode)
-            .image_color_space(surface_format.color_space)
-            .image_format(surface_format.format)
-            .image_extent(swapchain_extent)
-            .min_image_count(requested_image_count)
-            .image_array_layers(1)
-            .image_sharing_mode(SharingMode::EXCLUSIVE)
-            .image_usage(ImageUsageFlags::COLOR_ATTACHMENT)
-            .surface(surface.inner())
-            .pre_transform(SurfaceTransformFlagsKHR::IDENTITY)
-            .composite_alpha(CompositeAlphaFlagsKHR::OPAQUE);
-
-        //SAFETY: Valid ci
-        let swapchain = unsafe { swapchain_device.create_swapchain(&ci, None) }?;
-
-        //SAFETY: Swapchain was made from this swapchain_device
-        let images = unsafe { swapchain_device.get_swapchain_images(swapchain) }?;
-
-        let mut image_views = Vec::with_capacity(images.len());
-
-        for image in &images {
-            let ivci = ImageViewCreateInfo::default()
-                .image(*image)
-                .view_type(ImageViewType::TYPE_2D)
-                .components(ComponentMapping::default())
-                .format(surface_format.format)
-                .subresource_range(
-                    ImageSubresourceRange::default()
-                        .aspect_mask(ImageAspectFlags::COLOR)
-                        .base_mip_level(0)
-                        .level_count(1)
-                        .base_array_layer(0)
-                        .layer_count(1),
-                );
-
-            //SAFETY: ivci.image was created from the swapchain which is
-            //derived from device
-            let iv = unsafe { device.create_raw_image_view(&ivci) }?;
-            image_views.push(iv);
+            .map_err(PipelineLayoutCreateError::UnknownVulkan)?;
+            Ok(Self {
+                parent: device.clone(),
+                inner: pipeline_layout,
+            })
         }
-
-        Ok(Self {
-            parent_device: device.clone(),
-            parent_surface: surface.clone(),
-            swapchain,
-            swapchain_device,
-            _images: images,
-            image_views,
-        })
     }
 }
 
-impl Debug for Swapchain {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Swapchain")
-            .field("parent_device", &self.parent_device)
-            .field("parent_surface", &self.parent_surface)
-            .field("swapchain_device", &"{opaque}")
-            .field("swapchain", &self.swapchain)
-            .finish()
-    }
-}
+///Functionality related to swapchains
+pub mod swapchain {
+    use std::{fmt::Debug, sync::Arc};
 
-impl Drop for Swapchain {
-    fn drop(&mut self) {
-        for iv in self.image_views.drain(..) {
-            //SAFETY: iv was created on this device
-            unsafe { self.parent_device.destroy_raw_image_view(iv) };
+    use ash::vk::{
+        ColorSpaceKHR, ComponentMapping, CompositeAlphaFlagsKHR, Extent2D, Format, Image,
+        ImageAspectFlags, ImageSubresourceRange, ImageUsageFlags, ImageView, ImageViewCreateInfo,
+        ImageViewType, PresentModeKHR, SharingMode, SurfaceTransformFlagsKHR,
+        SwapchainCreateInfoKHR, SwapchainKHR,
+    };
+
+    use crate::rvk::{device::Device, surface::Surface};
+
+    /// Thing that we render to
+    pub struct Swapchain {
+        /// Device that we were made with
+        parent_device: Arc<Device>,
+        /// Surface that we were made with
+        parent_surface: Arc<Surface>,
+        /// Loaded extension function pointers
+        swapchain_device: ash::khr::swapchain::Device,
+        /// Actual handle to the surface
+        swapchain: SwapchainKHR,
+        /// Images associated with the swapchain
+        _images: Vec<Image>,
+        /// Image views associated with above images
+        image_views: Vec<ImageView>,
+    }
+
+    #[derive(thiserror::Error, Debug)]
+    /// Errors that pop up when we create a swapchain
+    pub enum SwapchainCreateError {
+        /// We don't know what went wrong but vulkan did it. Effectively the
+        /// default shrug answer
+        #[error("Unknown Vulkan error {0}")]
+        UnknownVulkan(ash::vk::Result),
+        /// You passed in a surface and device that are not derived from the
+        /// same instance
+        #[error("Incompatible parameters (device and surface are not from same instance)")]
+        IncompatibleParameters,
+        /// For some reason we can't pick a format. So we can't create a swapchain. Should basically
+        /// never happen
+        #[error("No compatible format found")]
+        NoCompatibleFormat,
+    }
+    impl From<ash::vk::Result> for SwapchainCreateError {
+        fn from(value: ash::vk::Result) -> Self {
+            Self::UnknownVulkan(value)
         }
-        //SAFETY: Swapchain was made with this swapchain_device
-        unsafe {
-            self.swapchain_device
-                .destroy_swapchain(self.swapchain, None)
-        };
+    }
+
+    impl Swapchain {
+        /// Create a swapchain from this device and surface. Might wanna
+        /// make some optional parameters to configure? But rn this is
+        /// wrapping how *I* set up a swapchain
+        pub(crate) fn create(
+            device: &Arc<Device>,
+            surface: &Arc<Surface>,
+        ) -> Result<Swapchain, SwapchainCreateError> {
+            if device.get_parent().raw_handle() != surface.parent_instance().raw_handle() {
+                return Err(SwapchainCreateError::IncompatibleParameters);
+            }
+            let swapchain_device =
+                ash::khr::swapchain::Device::new(device.parent_instance().inner(), device.inner());
+
+            //SAFETY: surface and device are derived from the same instance
+            let (surface_capabilities, surface_formats, present_modes) = unsafe {
+                (
+                    surface.get_capabilities_unsafe(device)?,
+                    surface.get_formats_unsafe(device)?,
+                    surface.get_present_modes_unsafe(device)?,
+                )
+            };
+
+            let present_mode = present_modes
+                .iter()
+                .find(|pm| **pm == PresentModeKHR::MAILBOX)
+                .copied()
+                .unwrap_or(PresentModeKHR::FIFO);
+
+            let surface_format = surface_formats
+                .iter()
+                .find(|format| {
+                    format.color_space == ColorSpaceKHR::SRGB_NONLINEAR
+                        && format.format == Format::B8G8R8A8_SRGB
+                })
+                .copied()
+                .or(surface_formats.first().copied())
+                .ok_or(SwapchainCreateError::NoCompatibleFormat)?;
+
+            let swapchain_extent = if surface_capabilities.current_extent.width != u32::MAX {
+                surface_capabilities.current_extent
+            } else {
+                let surface_extent = surface.get_surface_extent();
+
+                Extent2D {
+                    width: surface_extent.width.clamp(
+                        surface_capabilities.min_image_extent.width,
+                        surface_capabilities.max_image_extent.height,
+                    ),
+                    height: surface_extent.height.clamp(
+                        surface_capabilities.min_image_extent.height,
+                        surface_capabilities.max_image_extent.height,
+                    ),
+                }
+            };
+            let default_image_count = surface_capabilities.min_image_count + 1;
+            let max_image_count = surface_capabilities.max_image_count;
+            let requested_image_count =
+                if max_image_count != 0 && max_image_count < default_image_count {
+                    max_image_count
+                } else {
+                    default_image_count
+                };
+
+            //TODO: Different image sharing mode?
+            let ci = SwapchainCreateInfoKHR::default()
+                .present_mode(present_mode)
+                .image_color_space(surface_format.color_space)
+                .image_format(surface_format.format)
+                .image_extent(swapchain_extent)
+                .min_image_count(requested_image_count)
+                .image_array_layers(1)
+                .image_sharing_mode(SharingMode::EXCLUSIVE)
+                .image_usage(ImageUsageFlags::COLOR_ATTACHMENT)
+                .surface(surface.inner())
+                .pre_transform(SurfaceTransformFlagsKHR::IDENTITY)
+                .composite_alpha(CompositeAlphaFlagsKHR::OPAQUE);
+
+            //SAFETY: Valid ci
+            let swapchain = unsafe { swapchain_device.create_swapchain(&ci, None) }?;
+
+            //SAFETY: Swapchain was made from this swapchain_device
+            let images = unsafe { swapchain_device.get_swapchain_images(swapchain) }?;
+
+            let mut image_views = Vec::with_capacity(images.len());
+
+            for image in &images {
+                let ivci = ImageViewCreateInfo::default()
+                    .image(*image)
+                    .view_type(ImageViewType::TYPE_2D)
+                    .components(ComponentMapping::default())
+                    .format(surface_format.format)
+                    .subresource_range(
+                        ImageSubresourceRange::default()
+                            .aspect_mask(ImageAspectFlags::COLOR)
+                            .base_mip_level(0)
+                            .level_count(1)
+                            .base_array_layer(0)
+                            .layer_count(1),
+                    );
+
+                //SAFETY: ivci.image was created from the swapchain which is
+                //derived from device
+                let iv = unsafe { device.inner().create_image_view(&ivci, None) }?;
+                image_views.push(iv);
+            }
+
+            Ok(Self {
+                parent_device: device.clone(),
+                parent_surface: surface.clone(),
+                swapchain,
+                swapchain_device,
+                _images: images,
+                image_views,
+            })
+        }
+    }
+
+    impl Debug for Swapchain {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Swapchain")
+                .field("parent_device", &self.parent_device)
+                .field("parent_surface", &self.parent_surface)
+                .field("swapchain_device", &"{opaque}")
+                .field("swapchain", &self.swapchain)
+                .finish()
+        }
+    }
+
+    impl Drop for Swapchain {
+        fn drop(&mut self) {
+            for iv in self.image_views.drain(..) {
+                //SAFETY: iv was created on this device
+                unsafe { self.parent_device.inner().destroy_image_view(iv, None) };
+            }
+            //SAFETY: Swapchain was made with this swapchain_device
+            unsafe {
+                self.swapchain_device
+                    .destroy_swapchain(self.swapchain, None)
+            };
+        }
     }
 }
-
 /// Functionality related to the instance. Exists for scoping reasons
-mod instance {
+pub mod instance {
     use ash::{
         vk::{
             self, DebugUtilsMessageSeverityFlagsEXT, DebugUtilsMessageTypeFlagsEXT,
@@ -511,7 +563,7 @@ mod instance {
 }
 
 /// Functionality related to the surface. Exists for scoping reasons
-mod surface {
+pub mod surface {
     use std::{fmt::Debug, sync::Arc};
 
     use ash::{
@@ -524,7 +576,7 @@ mod surface {
         window::Window,
     };
 
-    use super::{Device, Instance};
+    use super::{device::Device, instance::Instance};
 
     /// Represents a VkSurfaceKHR.
     pub(crate) struct Surface {
@@ -707,26 +759,22 @@ mod surface {
 }
 
 /// implementation related to device. Exists for scoping reasons
-mod device {
+pub mod device {
     use std::{fmt::Debug, sync::Arc};
 
-    use ash::{
-        prelude::VkResult,
-        vk::{
-            self, DeviceCreateInfo, DeviceQueueCreateInfo, ImageView, ImageViewCreateInfo,
-            PhysicalDeviceFeatures2, PhysicalDeviceVulkan12Features,
-            PhysicalDeviceVulkan13Features, QueueFlags,
-        },
+    use ash::vk::{
+        self, DeviceCreateInfo, DeviceQueueCreateInfo, PhysicalDeviceFeatures2,
+        PhysicalDeviceVulkan12Features, PhysicalDeviceVulkan13Features, QueueFlags,
     };
     use thiserror::Error;
 
     use crate::Version;
 
-    use super::{Instance, Surface};
+    use super::{instance::Instance, surface::Surface};
 
     //TODO: Support separate present and graphics queue
     /// Represents a VkDevice
-    pub(crate) struct Device {
+    pub struct Device {
         /// Parent for RAII purposes
         parent: Arc<Instance>,
         ///Underlying VkDevice
@@ -803,47 +851,13 @@ mod device {
         formats: Vec<vk::SurfaceFormatKHR>,
     }
     impl Device {
-        ///Destroys a raw shader module
-        ///
-        /// SAFETY: shader was made by self
-        pub(super) unsafe fn destroy_raw_shader(&self, shader: ash::vk::ShaderModule) {
-            // SAFETY: Shader was made from this device
-            unsafe { self.inner().destroy_shader_module(shader, None) };
-        }
-        ///Creates a raw shader module. Generally for internal use.
-        ///
-        /// SAFETY: spv_bytes is a valid spir-v module
-        pub(super) unsafe fn create_raw_shader(&self, spv_bytes: &[u32]) -> ash::vk::ShaderModule {
-            let ci = vk::ShaderModuleCreateInfo::default().code(spv_bytes);
-            //SAFETY: spv_bytes is a valid spir-v module
-            unsafe { self.inner().create_shader_module(&ci, None) }.unwrap()
-        }
         ///Get a reference to the parent instance
-        pub(crate) fn get_parent(&self) -> &Instance {
+        pub(super) fn get_parent(&self) -> &Instance {
             &self.parent
         }
-        ///Creates a raw image view. Generally for internal use.
-        ///
-        /// SAFETY: ci.image must be associated with this device. Otherwise
-        /// see [vkCreateImageView](https://registry.khronos.org/vulkan/specs/latest/man/html/vkCreateImageView.html)
-        pub(crate) unsafe fn create_raw_image_view(
-            &self,
-            ci: &ImageViewCreateInfo,
-        ) -> VkResult<ash::vk::ImageView> {
-            //SAFETY: From preconditions of this unsafe function
-            unsafe { self.device.create_image_view(ci, None) }
-        }
 
-        ///Destroys a raw image view. Generally for internal use.
-        ///
-        /// SAFETY: image_view must be from self. Otherwise see
-        /// [vcDestroyImageView](https://registry.khronos.org/vulkan/specs/latest/man/html/vkDestroyImageView.html)
-        pub(crate) unsafe fn destroy_raw_image_view(&self, image_view: ImageView) {
-            //SAFETY: Inherited from preconditions of this unsafe function
-            unsafe { self.device.destroy_image_view(image_view, None) };
-        }
         ///Get the instance that was used to create this device
-        pub(crate) fn parent_instance(&self) -> &Arc<Instance> {
+        pub(super) fn parent_instance(&self) -> &Arc<Instance> {
             &self.parent
         }
 
@@ -853,7 +867,7 @@ mod device {
         }
 
         /// Create a device that is compatible with the surface
-        pub(crate) fn create_compatible(
+        pub fn create_compatible(
             instance: &Arc<Instance>,
             surface: &Surface,
             min_api_version: Version,
@@ -1116,7 +1130,7 @@ pub mod shader {
     };
     use thiserror::Error;
 
-    use super::Device;
+    use super::device::Device;
 
     #[derive(Debug)]
     /// What type of shader we're talking about. Maybe we can exclude this if we
@@ -1189,6 +1203,7 @@ pub mod shader {
         },
         /// Some weird backend error
         Backend(naga::back::spv::Error, Option<PathBuf>),
+        UnknownVulkan(vk::Result),
     }
 
     impl Display for ShaderCompileError {
@@ -1224,6 +1239,10 @@ pub mod shader {
                     ))?;
                     Display::fmt(error, f)?;
                     Ok(())
+                }
+                ShaderCompileError::UnknownVulkan(e) => {
+                    f.write_str("Could not create shader due to unknown vulkan error: ")?;
+                    Display::fmt(&e, f)
                 }
             }
         }
@@ -1376,8 +1395,15 @@ pub mod shader {
                 )
                 .map_err(|e| ShaderCompileError::Backend(e, file_path.map(Path::to_owned)))?;
 
+            let shader_mod_ci = vk::ShaderModuleCreateInfo::default().code(&spv_bytes);
+
             //SAFETY: We got spv_bytes from naga's backend so it *should* be valid Spir-V
-            let vk_shader = unsafe { self.parent_device.create_raw_shader(&spv_bytes) };
+            let vk_shader = unsafe {
+                self.parent_device
+                    .inner()
+                    .create_shader_module(&shader_mod_ci, None)
+            }
+            .map_err(ShaderCompileError::UnknownVulkan)?;
 
             Ok(Shader {
                 vk_shader,
@@ -1391,7 +1417,11 @@ pub mod shader {
         fn drop(&mut self) {
             //SAFETY: We know that self.vk_shader was made from
             //self.parent_device
-            unsafe { self.parent_device.destroy_raw_shader(self.vk_shader) };
+            unsafe {
+                self.parent_device
+                    .inner()
+                    .destroy_shader_module(self.vk_shader, None)
+            };
         }
     }
 }

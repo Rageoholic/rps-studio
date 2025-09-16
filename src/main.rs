@@ -8,7 +8,7 @@
     clippy::missing_safety_doc
 )]
 // Uncomment to check for undocumented stuff
-#![warn(clippy::missing_docs_in_private_items)]
+//#![warn(clippy::missing_docs_in_private_items)]
 
 /// Current Top Level crate for our app. Will break up in future
 use core::fmt::Debug;
@@ -22,14 +22,20 @@ use app_dirs2::AppInfo;
 
 use clap::Parser;
 
-use rvk::{Device, Instance, Surface, Swapchain, VulkanDebugLevel};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use winit::{
     application::ApplicationHandler, event::WindowEvent, event_loop,
     raw_window_handle::HasDisplayHandle, window::Window,
 };
 
-use crate::rvk::shader::{ShaderCompiler, ShaderDebugLevel, ShaderOptLevel, ShaderType};
+use rvk::{
+    device::Device,
+    instance::{Instance, VulkanDebugLevel},
+    pipeline::PipelineLayout,
+    shader::{ShaderCompiler, ShaderDebugLevel, ShaderOptLevel, ShaderType},
+    surface::Surface,
+    swapchain::Swapchain,
+};
 
 /// Our app info for app_dirs2
 const APP_INFO: AppInfo = AppInfo {
@@ -50,6 +56,7 @@ struct RunningState {
     device: Arc<Device>,
     /// A swapchain we are currently using
     _swapchain: Swapchain,
+    pipeline_layout: PipelineLayout,
 }
 
 /// State of the application while suspended
@@ -61,6 +68,7 @@ struct SuspendedState {
     instance: Arc<Instance>,
     /// handle to GPU device
     device: Arc<Device>,
+    pipeline_layout: PipelineLayout,
 }
 
 /// State of the app before initialization
@@ -282,6 +290,14 @@ impl ApplicationHandler for AppRunner {
                     return;
                 }
             };
+            let _pipeline_layout = match PipelineLayout::new(&device) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!("Could not create pipeline layout: Error {}", e);
+                    event_loop.exit();
+                    return;
+                }
+            };
 
             win.set_visible(true);
 
@@ -291,11 +307,13 @@ impl ApplicationHandler for AppRunner {
                 _surface: surface,
                 device,
                 _swapchain: swapchain,
+                pipeline_layout: _pipeline_layout,
             }))
         } else if let Some(SuspendedState {
             win,
             instance,
             device,
+            pipeline_layout,
         }) = self.take_suspended()
         {
             let surface = match Surface::from_winit_window(&win, &instance) {
@@ -315,6 +333,7 @@ impl ApplicationHandler for AppRunner {
                 }
             };
             self.app_state = Some(AppState::Running(RunningState {
+                pipeline_layout,
                 win,
                 instance,
                 _surface: surface,
@@ -333,6 +352,7 @@ impl ApplicationHandler for AppRunner {
             _surface: _,
             device,
             _swapchain: _,
+            pipeline_layout,
         }) = self.take_running()
         {
             event_loop.set_control_flow(event_loop::ControlFlow::Wait);
@@ -340,6 +360,7 @@ impl ApplicationHandler for AppRunner {
                 win,
                 instance,
                 device,
+                pipeline_layout,
             }))
         }
 
@@ -357,6 +378,7 @@ impl ApplicationHandler for AppRunner {
             _surface: _,
             device: _,
             _swapchain: _,
+            pipeline_layout: _,
         }) = self.as_running_mut()
         {
             if win.id() == window_id {
