@@ -32,12 +32,10 @@ use rvk::{
     device::Device,
     instance::{Instance, VulkanDebugLevel},
     pipeline::{Pipeline, PipelineLayout, RenderPass},
-    shader::{ShaderCompiler, ShaderDebugLevel, ShaderOptLevel, ShaderType},
+    shader::{Shader, ShaderCompiler, ShaderDebugLevel, ShaderOptLevel, ShaderType},
     surface::Surface,
     swapchain::Swapchain,
 };
-
-use crate::rvk::shader::Shader;
 
 /// Our app info for app_dirs2
 const APP_INFO: AppInfo = AppInfo {
@@ -53,11 +51,11 @@ struct RunningState {
     /// Our vk instance
     instance: Arc<Instance>,
     /// Surface corresponding to window
-    _surface: Arc<Surface>,
+    surface: Arc<Surface>,
     /// handle to the GPU device
     device: Arc<Device>,
     /// A swapchain we are currently using
-    _swapchain: Arc<Swapchain>,
+    swapchain: Arc<Swapchain>,
     pipeline_layout: Arc<PipelineLayout>,
     pipeline: Pipeline,
     vert_shader: Arc<Shader>,
@@ -218,7 +216,7 @@ impl ApplicationHandler for AppRunner {
     fn resumed(&mut self, event_loop: &event_loop::ActiveEventLoop) {
         if let Some(UninitState { instance }) = self.take_uninit() {
             let win_attributes = Window::default_attributes()
-                .with_resizable(false)
+                .with_resizable(true)
                 .with_visible(false);
             let win = Arc::new(match event_loop.create_window(win_attributes) {
                 Ok(win) => win,
@@ -253,7 +251,7 @@ impl ApplicationHandler for AppRunner {
             let frag_shader_source_loc: PathBuf =
                 [src_dir, Path::new("shader.frag")].iter().collect();
 
-            let swapchain = Arc::new(match Swapchain::create(&device, &surface) {
+            let swapchain = Arc::new(match Swapchain::create(&device, &surface, None) {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!("Could not create swapchain: Error {}", e);
@@ -339,9 +337,9 @@ impl ApplicationHandler for AppRunner {
             self.app_state = Some(AppState::Running(RunningState {
                 win,
                 instance,
-                _surface: surface,
+                surface,
                 device,
-                _swapchain: swapchain,
+                swapchain,
                 pipeline_layout,
                 pipeline,
                 vert_shader,
@@ -364,7 +362,7 @@ impl ApplicationHandler for AppRunner {
                     return;
                 }
             };
-            let swapchain = Arc::new(match Swapchain::create(&device, &surface) {
+            let swapchain = Arc::new(match Swapchain::create(&device, &surface, None) {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!("Could not recreate swapchain: Error {}", e);
@@ -398,9 +396,9 @@ impl ApplicationHandler for AppRunner {
                 pipeline_layout,
                 win,
                 instance,
-                _surface: surface,
+                surface,
                 device,
-                _swapchain: swapchain,
+                swapchain,
                 pipeline,
                 vert_shader,
                 frag_shader,
@@ -414,9 +412,9 @@ impl ApplicationHandler for AppRunner {
         if let Some(RunningState {
             instance,
             win,
-            _surface: _,
+            surface: _,
             device,
-            _swapchain: _,
+            swapchain: _,
             pipeline_layout,
             pipeline: _,
             vert_shader,
@@ -445,9 +443,9 @@ impl ApplicationHandler for AppRunner {
         if let Some(RunningState {
             win,
             instance: _,
-            _surface: _,
+            surface: _,
             device: _,
-            _swapchain: _,
+            swapchain: _,
             pipeline_layout: _,
             pipeline: _,
             vert_shader: _,
@@ -461,6 +459,66 @@ impl ApplicationHandler for AppRunner {
                         self.app_state = Some(AppState::Exiting);
                         event_loop.exit();
                     }
+                    WindowEvent::Resized(new_size) => {
+                        let state = self.take_running().expect("We should be good");
+                        assert!(state.win.inner_size() == new_size);
+                        let new_swapchain = Arc::new(
+                            match Swapchain::create(
+                                &state.device,
+                                &state.surface,
+                                Some(&state.swapchain),
+                            ) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Error while creating swapchain due to resize {}",
+                                        e
+                                    );
+                                    return event_loop.exit();
+                                }
+                            },
+                        );
+
+                        let new_renderpass = match RenderPass::new(&state.device, &new_swapchain) {
+                            Ok(r) => Arc::new(r),
+                            Err(e) => {
+                                tracing::error!(
+                                    "Error while creating render pass due to resize {}",
+                                    e
+                                );
+                                return event_loop.exit();
+                            }
+                        };
+                        let new_pipeline = match Pipeline::new(
+                            &state.device,
+                            &state.pipeline_layout,
+                            &new_renderpass,
+                            &state.vert_shader,
+                            &state.frag_shader,
+                        ) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tracing::error!(
+                                    "Error while creating pipeline due to resize {}",
+                                    e
+                                );
+                                return event_loop.exit();
+                            }
+                        };
+
+                        self.app_state = Some(AppState::Running(RunningState {
+                            win: state.win,
+                            instance: state.instance,
+                            surface: state.surface,
+                            device: state.device,
+                            swapchain: new_swapchain,
+                            pipeline_layout: state.pipeline_layout,
+                            pipeline: new_pipeline,
+                            vert_shader: state.vert_shader,
+                            frag_shader: state.frag_shader,
+                        }));
+                    }
+
                     _ => {}
                 }
             }

@@ -307,6 +307,7 @@ pub mod swapchain {
         pub(crate) fn create(
             device: &Arc<Device>,
             surface: &Arc<Surface>,
+            old_swapchain: Option<&Self>,
         ) -> Result<Swapchain, SwapchainCreateError> {
             if device.get_parent().raw_handle() != surface.parent_instance().raw_handle() {
                 return Err(SwapchainCreateError::IncompatibleParameters);
@@ -376,7 +377,12 @@ pub mod swapchain {
                 .image_usage(ImageUsageFlags::COLOR_ATTACHMENT)
                 .surface(surface.inner())
                 .pre_transform(SurfaceTransformFlagsKHR::IDENTITY)
-                .composite_alpha(CompositeAlphaFlagsKHR::OPAQUE);
+                .composite_alpha(CompositeAlphaFlagsKHR::OPAQUE)
+                .old_swapchain(
+                    old_swapchain
+                        .map(|s| s.swapchain)
+                        .unwrap_or(vk::SwapchainKHR::null()),
+                );
 
             //SAFETY: Valid ci
             let swapchain = unsafe { swapchain_device.create_swapchain(&ci, None) }?;
