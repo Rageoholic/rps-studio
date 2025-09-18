@@ -37,6 +37,8 @@ use rvk::{
     swapchain::Swapchain,
 };
 
+use crate::rvk::shader::Shader;
+
 /// Our app info for app_dirs2
 const APP_INFO: AppInfo = AppInfo {
     name: "rps-studio",
@@ -57,6 +59,9 @@ struct RunningState {
     /// A swapchain we are currently using
     _swapchain: Arc<Swapchain>,
     pipeline_layout: Arc<PipelineLayout>,
+    pipeline: Pipeline,
+    vert_shader: Arc<Shader>,
+    frag_shader: Arc<Shader>,
 }
 
 /// State of the application while suspended
@@ -69,6 +74,8 @@ struct SuspendedState {
     /// handle to GPU device
     device: Arc<Device>,
     pipeline_layout: Arc<PipelineLayout>,
+    vert_shader: Arc<Shader>,
+    frag_shader: Arc<Shader>,
 }
 
 /// State of the app before initialization
@@ -336,12 +343,17 @@ impl ApplicationHandler for AppRunner {
                 device,
                 _swapchain: swapchain,
                 pipeline_layout,
+                pipeline,
+                vert_shader,
+                frag_shader,
             }))
         } else if let Some(SuspendedState {
             win,
             instance,
             device,
             pipeline_layout,
+            vert_shader,
+            frag_shader,
         }) = self.take_suspended()
         {
             let surface = match Surface::from_winit_window(&win, &instance) {
@@ -360,6 +372,28 @@ impl ApplicationHandler for AppRunner {
                     return;
                 }
             });
+            let render_pass = Arc::new(match RenderPass::new(&device, &swapchain) {
+                Ok(rp) => rp,
+                Err(e) => {
+                    tracing::error!("Could not recreate render pass: Error {}", e);
+                    event_loop.exit();
+                    return;
+                }
+            });
+            let pipeline = match Pipeline::new(
+                &device,
+                &pipeline_layout,
+                &render_pass,
+                &vert_shader,
+                &frag_shader,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!("Could not recreate pipeline: Error{}", e);
+                    event_loop.exit();
+                    return;
+                }
+            };
             self.app_state = Some(AppState::Running(RunningState {
                 pipeline_layout,
                 win,
@@ -367,6 +401,9 @@ impl ApplicationHandler for AppRunner {
                 _surface: surface,
                 device,
                 _swapchain: swapchain,
+                pipeline,
+                vert_shader,
+                frag_shader,
             }));
         }
 
@@ -381,6 +418,9 @@ impl ApplicationHandler for AppRunner {
             device,
             _swapchain: _,
             pipeline_layout,
+            pipeline: _,
+            vert_shader,
+            frag_shader,
         }) = self.take_running()
         {
             event_loop.set_control_flow(event_loop::ControlFlow::Wait);
@@ -389,6 +429,8 @@ impl ApplicationHandler for AppRunner {
                 instance,
                 device,
                 pipeline_layout,
+                vert_shader,
+                frag_shader,
             }))
         }
 
@@ -407,6 +449,9 @@ impl ApplicationHandler for AppRunner {
             device: _,
             _swapchain: _,
             pipeline_layout: _,
+            pipeline: _,
+            vert_shader: _,
+            frag_shader: _,
         }) = self.as_running_mut()
         {
             if win.id() == window_id {
