@@ -31,7 +31,7 @@ use winit::{
 use rvk::{
     device::Device,
     instance::{Instance, VulkanDebugLevel},
-    pipeline::{Pipeline, PipelineLayout, RenderPass},
+    pipeline::{DynamicPipeline, PipelineLayout},
     shader::{Shader, ShaderCompiler, ShaderDebugLevel, ShaderOptLevel, ShaderType},
     surface::Surface,
     swapchain::Swapchain,
@@ -57,7 +57,7 @@ struct RunningState {
     /// A swapchain we are currently using
     swapchain: Arc<Swapchain>,
     pipeline_layout: Arc<PipelineLayout>,
-    pipeline: Pipeline,
+    _pipeline: Arc<DynamicPipeline>,
     vert_shader: Arc<Shader>,
     frag_shader: Arc<Shader>,
 }
@@ -308,29 +308,22 @@ impl ApplicationHandler for AppRunner {
                 }
             });
 
-            let render_pass = Arc::new(match RenderPass::new(&device, &swapchain) {
-                Ok(rp) => rp,
-                Err(e) => {
-                    tracing::error!("Could not create render pass: Error {}", e);
-                    event_loop.exit();
-                    return;
-                }
-            });
-
-            let pipeline = match Pipeline::new(
-                &device,
-                &pipeline_layout,
-                &render_pass,
-                &vert_shader,
-                &frag_shader,
-            ) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::error!("Could not create pipeline: Error {}", e);
-                    event_loop.exit();
-                    return;
-                }
-            };
+            let pipeline = Arc::new(
+                match DynamicPipeline::new(
+                    &device,
+                    &pipeline_layout,
+                    &swapchain,
+                    &vert_shader,
+                    &frag_shader,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::error!("Could not create pipeline: Error {}", e);
+                        event_loop.exit();
+                        return;
+                    }
+                },
+            );
 
             win.set_visible(true);
 
@@ -341,7 +334,7 @@ impl ApplicationHandler for AppRunner {
                 device,
                 swapchain,
                 pipeline_layout,
-                pipeline,
+                _pipeline: pipeline,
                 vert_shader,
                 frag_shader,
             }))
@@ -370,28 +363,23 @@ impl ApplicationHandler for AppRunner {
                     return;
                 }
             });
-            let render_pass = Arc::new(match RenderPass::new(&device, &swapchain) {
-                Ok(rp) => rp,
-                Err(e) => {
-                    tracing::error!("Could not recreate render pass: Error {}", e);
-                    event_loop.exit();
-                    return;
-                }
-            });
-            let pipeline = match Pipeline::new(
-                &device,
-                &pipeline_layout,
-                &render_pass,
-                &vert_shader,
-                &frag_shader,
-            ) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::error!("Could not recreate pipeline: Error{}", e);
-                    event_loop.exit();
-                    return;
-                }
-            };
+
+            let pipeline = Arc::new(
+                match DynamicPipeline::new(
+                    &device,
+                    &pipeline_layout,
+                    &swapchain,
+                    &vert_shader,
+                    &frag_shader,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::error!("Could not recreate pipeline: Error{}", e);
+                        event_loop.exit();
+                        return;
+                    }
+                },
+            );
             self.app_state = Some(AppState::Running(RunningState {
                 pipeline_layout,
                 win,
@@ -399,7 +387,7 @@ impl ApplicationHandler for AppRunner {
                 surface,
                 device,
                 swapchain,
-                pipeline,
+                _pipeline: pipeline,
                 vert_shader,
                 frag_shader,
             }));
@@ -416,7 +404,7 @@ impl ApplicationHandler for AppRunner {
             device,
             swapchain: _,
             pipeline_layout,
-            pipeline: _,
+            _pipeline: _,
             vert_shader,
             frag_shader,
         }) = self.take_running()
@@ -447,7 +435,7 @@ impl ApplicationHandler for AppRunner {
             device: _,
             swapchain: _,
             pipeline_layout: _,
-            pipeline: _,
+            _pipeline: _,
             vert_shader: _,
             frag_shader: _,
         }) = self.as_running_mut()
@@ -479,32 +467,24 @@ impl ApplicationHandler for AppRunner {
                             },
                         );
 
-                        let new_renderpass = match RenderPass::new(&state.device, &new_swapchain) {
-                            Ok(r) => Arc::new(r),
-                            Err(e) => {
-                                tracing::error!(
-                                    "Error while creating render pass due to resize {}",
-                                    e
-                                );
-                                return event_loop.exit();
-                            }
-                        };
-                        let new_pipeline = match Pipeline::new(
-                            &state.device,
-                            &state.pipeline_layout,
-                            &new_renderpass,
-                            &state.vert_shader,
-                            &state.frag_shader,
-                        ) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                tracing::error!(
-                                    "Error while creating pipeline due to resize {}",
-                                    e
-                                );
-                                return event_loop.exit();
-                            }
-                        };
+                        let new_pipeline = Arc::new(
+                            match DynamicPipeline::new(
+                                &state.device,
+                                &state.pipeline_layout,
+                                &new_swapchain,
+                                &state.vert_shader,
+                                &state.frag_shader,
+                            ) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Error while creating pipeline due to resize {}",
+                                        e
+                                    );
+                                    return event_loop.exit();
+                                }
+                            },
+                        );
 
                         self.app_state = Some(AppState::Running(RunningState {
                             win: state.win,
@@ -513,7 +493,7 @@ impl ApplicationHandler for AppRunner {
                             device: state.device,
                             swapchain: new_swapchain,
                             pipeline_layout: state.pipeline_layout,
-                            pipeline: new_pipeline,
+                            _pipeline: new_pipeline,
                             vert_shader: state.vert_shader,
                             frag_shader: state.frag_shader,
                         }));

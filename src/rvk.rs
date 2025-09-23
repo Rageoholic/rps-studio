@@ -52,9 +52,8 @@ pub mod pipeline {
     }
 
     #[derive(Debug)]
-    pub struct Pipeline {
+    pub struct DynamicPipeline {
         parent: Arc<Device>,
-        _render_pass: Arc<RenderPass>,
         _layout: Arc<PipelineLayout>,
         _vert_shader: Arc<Shader>,
         _frag_shader: Arc<Shader>,
@@ -69,15 +68,18 @@ pub mod pipeline {
         UnknownVk(vk::Result),
     }
 
-    impl Pipeline {
+    impl DynamicPipeline {
         pub fn new(
-            parent: &Arc<Device>,
+            parent_device: &Arc<Device>,
             layout: &Arc<PipelineLayout>,
-            render_pass: &Arc<RenderPass>,
+            parent_swapchain: &Arc<Swapchain>,
             vert_shader: &Arc<Shader>,
             frag_shader: &Arc<Shader>,
         ) -> Result<Self, PipelineCreateError> {
             use PipelineCreateError as Error;
+            if **parent_device != *Swapchain::get_parent(parent_swapchain) {
+                Err(Error::MismatchedDevices)?
+            }
             let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
             let dynamic_state =
                 vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
@@ -106,10 +108,6 @@ pub mod pipeline {
                 .logic_op_enable(false)
                 .attachments(&color_blend_states);
 
-            if layout.parent != *parent || *parent != render_pass.parent_device {
-                Err(Error::MismatchedDevices)?
-            }
-
             let stages = [
                 vk::PipelineShaderStageCreateInfo::default()
                     .module((vert_shader).inner())
@@ -121,6 +119,10 @@ pub mod pipeline {
                     .name(c"main"),
             ];
 
+            let color_attachment_formats = [parent_swapchain.get_color_format()];
+            let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
+                .color_attachment_formats(&color_attachment_formats);
+
             let pipeline_ci = vk::GraphicsPipelineCreateInfo::default()
                 .stages(&stages)
                 .vertex_input_state(&vertex_input_state)
@@ -131,12 +133,12 @@ pub mod pipeline {
                 .color_blend_state(&color_blend_ci)
                 .dynamic_state(&dynamic_state)
                 .layout(layout.inner)
-                .render_pass(render_pass.render_pass)
-                .subpass(0);
+                .subpass(0)
+                .push_next(&mut rendering_info);
 
             //SAFETY: valid ci
             let pipeline = unsafe {
-                parent.inner().create_graphics_pipelines(
+                parent_device.inner().create_graphics_pipelines(
                     vk::PipelineCache::null(),
                     &[pipeline_ci],
                     None,
@@ -145,15 +147,15 @@ pub mod pipeline {
             .map_err(|e| {
                 for p in e.0 {
                     //SAFETY: created p from parent
-                    unsafe { parent.inner().destroy_pipeline(p, None) };
+                    unsafe { parent_device.inner().destroy_pipeline(p, None) };
                 }
                 Error::UnknownVk(e.1)
             })?;
 
             Ok(Self {
-                parent: parent.clone(),
+                parent: parent_device.clone(),
                 _layout: layout.clone(),
-                _render_pass: render_pass.clone(),
+
                 _vert_shader: vert_shader.clone(),
                 _frag_shader: frag_shader.clone(),
                 pipeline: pipeline[0],
@@ -161,81 +163,10 @@ pub mod pipeline {
         }
     }
 
-    impl Drop for Pipeline {
+    impl Drop for DynamicPipeline {
         fn drop(&mut self) {
             //SAFETY: pipeline is from parent
             unsafe { self.parent.inner().destroy_pipeline(self.pipeline, None) };
-        }
-    }
-
-    #[derive(Debug)]
-    pub struct RenderPass {
-        parent_device: Arc<Device>,
-        parent_swapchain: Arc<Swapchain>,
-        render_pass: vk::RenderPass,
-    }
-    impl PartialEq for RenderPass {
-        fn eq(&self, other: &Self) -> bool {
-            self.parent_device == other.parent_device
-                && self.parent_swapchain == other.parent_swapchain
-                && self.render_pass == other.render_pass
-        }
-    }
-
-    impl Eq for RenderPass {}
-
-    #[derive(Error, Debug)]
-    pub enum RenderPassCreateError {
-        #[error("Unknown vk error {0}")]
-        UnknownVulkan(vk::Result),
-    }
-    impl RenderPass {
-        pub fn new(
-            parent_device: &Arc<Device>,
-            parent_swapchain: &Arc<Swapchain>,
-        ) -> Result<Self, RenderPassCreateError> {
-            let color_attachment_format = parent_swapchain.get_color_format();
-            let color_attachments = [vk::AttachmentDescription::default()
-                .format(color_attachment_format)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::STORE)
-                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-                .initial_layout(vk::ImageLayout::UNDEFINED)
-                .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                .samples(vk::SampleCountFlags::TYPE_1)];
-
-            let color_attachment_refs = [vk::AttachmentReference::default()
-                .attachment(0)
-                .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
-            let subpasses =
-                [vk::SubpassDescription::default().color_attachments(&color_attachment_refs)];
-            let render_pass_ci = vk::RenderPassCreateInfo::default()
-                .attachments(&color_attachments)
-                .subpasses(&subpasses);
-
-            // SAFETY: Valid CI
-            let render_pass = unsafe {
-                parent_device
-                    .inner()
-                    .create_render_pass(&render_pass_ci, None)
-            }
-            .map_err(RenderPassCreateError::UnknownVulkan)?;
-            Ok(Self {
-                parent_device: parent_device.clone(),
-                parent_swapchain: parent_swapchain.clone(),
-                render_pass,
-            })
-        }
-    }
-    impl Drop for RenderPass {
-        fn drop(&mut self) {
-            //SAFETY: We made render_pass with parent_device
-            unsafe {
-                self.parent_device
-                    .inner()
-                    .destroy_render_pass(self.render_pass, None);
-            }
         }
     }
 }
@@ -426,6 +357,10 @@ pub mod swapchain {
 
         pub(crate) fn get_color_format(&self) -> vk::Format {
             self._surface_format.format
+        }
+
+        pub(crate) fn get_parent(self: &Swapchain) -> &Device {
+            &self.parent_device
         }
     }
 
