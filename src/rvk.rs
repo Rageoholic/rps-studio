@@ -1,3 +1,32 @@
+#![allow(dead_code, unused_variables, reason = "In work")]
+
+use std::sync::{Arc, LockResult, Mutex};
+
+/// Extension methods for [`LockResult`].
+///
+/// [`LockResult`]: https://doc.rust-lang.org/stable/std/sync/type.LockResult.html
+pub trait LockResultExt {
+    type Guard;
+
+    /// Returns the lock guard even if the mutex is [poisoned].
+    ///
+    /// [poisoned]: https://doc.rust-lang.org/stable/std/sync/struct.Mutex.html#poisoning
+    fn ignore_poison(self) -> Self::Guard;
+}
+
+impl<Guard> LockResultExt for LockResult<Guard> {
+    type Guard = Guard;
+
+    fn ignore_poison(self) -> Guard {
+        self.unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+fn main() {
+    let x = Arc::new(Mutex::new(0));
+    println!("{}", x.lock().ignore_poison());
+}
+
 ///Pipeline related functionality
 pub mod pipeline {
     use std::sync::Arc;
@@ -167,6 +196,193 @@ pub mod pipeline {
         fn drop(&mut self) {
             //SAFETY: pipeline is from parent
             unsafe { self.parent.inner().destroy_pipeline(self.pipeline, None) };
+        }
+    }
+}
+
+pub mod command_buffers {
+    use std::sync::{Arc, Mutex};
+
+    use ash::vk;
+    use thiserror::Error;
+
+    use crate::rvk::{device::Device, LockResultExt};
+
+    #[derive(Debug)]
+    pub(crate) struct CommandPool {
+        parent_device: Arc<Device>,
+        pool: Mutex<vk::CommandPool>,
+    }
+
+    #[derive(Error, Debug)]
+    pub enum CommandPoolCreateError {
+        #[error("Unknown Vulkan Error {0}")]
+        UnknownVulkan(vk::Result),
+    }
+
+    impl CommandPool {
+        pub fn new(
+            parent_device: &Arc<Device>,
+            family_index: u32,
+        ) -> Result<Self, CommandPoolCreateError> {
+            use CommandPoolCreateError as Error;
+            let ci = vk::CommandPoolCreateInfo::default()
+                .queue_family_index(family_index)
+                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+
+            //SAFETY: Valid CI
+            let cp = unsafe { parent_device.inner().create_command_pool(&ci, None) }
+                .map_err(Error::UnknownVulkan)?;
+
+            Ok(Self {
+                parent_device: parent_device.clone(),
+                pool: Mutex::new(cp),
+            })
+        }
+        pub fn allocate_command_buffers(
+            self: &Arc<Self>,
+            count: u32,
+        ) -> Result<Vec<RaiiCommandBuffer>, AllocateCommandBuffersError> {
+            use AllocateCommandBuffersError as Error;
+            // Get exclusive access to the pool
+            let pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+            let cbai = vk::CommandBufferAllocateInfo::default()
+                .command_pool(*pool)
+                .command_buffer_count(count);
+
+            //SAFETY: pool comes from parent device, have exclusive access,
+            //valid allocate_info
+            let cbs = unsafe { self.parent_device.inner().allocate_command_buffers(&cbai) }
+                .map_err(|e| match e {
+                    vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
+                    | vk::Result::ERROR_OUT_OF_HOST_MEMORY => Error::MemoryExhaustion,
+                    _ => Error::UnknownVk(e),
+                })?;
+
+            Ok(cbs
+                .iter()
+                .map(|raw_cb| RaiiCommandBuffer {
+                    parent_pool: self.clone(),
+                    inner: *raw_cb,
+                })
+                .collect())
+        }
+    }
+    impl Drop for CommandPool {
+        fn drop(&mut self) {
+            //SAFETY: Exclusive access to pool, pool was created from parent_device
+            unsafe {
+                self.parent_device.inner().destroy_command_pool(
+                    *self.pool.get_mut().unwrap_or_else(|e| e.into_inner()),
+                    None,
+                )
+            };
+        }
+    }
+
+    #[derive(Error, Debug)]
+    pub enum AllocateCommandBuffersError {
+        #[error("Could not allocate due to memory exhaustion")]
+        MemoryExhaustion,
+        #[error("Unknown vulkan error {0}")]
+        UnknownVk(vk::Result),
+    }
+
+    #[derive(Debug)]
+    pub struct UnrecordedCommandBuffer {
+        cb: RaiiCommandBuffer,
+    }
+
+    #[derive(Debug)]
+    pub struct RaiiCommandBuffer {
+        parent_pool: Arc<CommandPool>,
+        inner: vk::CommandBuffer,
+    }
+
+    impl Drop for RaiiCommandBuffer {
+        fn drop(&mut self) {
+            let pool = self.parent_pool.pool.lock().ignore_poison();
+            //SAFETY: Exclusive access to pool due to lock, command buffer was
+            //allocated on this pool, pool was created on parent device
+            unsafe {
+                self.parent_pool
+                    .parent_device
+                    .inner()
+                    .free_command_buffers(*pool, &[self.inner])
+            };
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct CommandBufferEncoder {
+        cb: RaiiCommandBuffer,
+    }
+
+    #[derive(Debug, Error)]
+    pub enum CommandBufferBeginEncodeError {
+        #[error("Unknown Vulkan: {0}")]
+        UnknownVk(vk::Result),
+        #[error("Memory exhaustion")]
+        MemoryExhaustion,
+    }
+
+    impl RaiiCommandBuffer {
+        pub fn begin_encode(self) -> Result<CommandBufferEncoder, CommandBufferBeginEncodeError> {
+            use CommandBufferBeginEncodeError as Error;
+            //SAFETY: inner is a valid allocated command buffer, inner is
+            //allocated from parent_pool, parent_pool is derived from device
+            unsafe {
+                self.parent_pool.parent_device.inner().begin_command_buffer(
+                    self.inner,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+            }
+            .map_err(|e| match e {
+                vk::Result::ERROR_OUT_OF_DEVICE_MEMORY | vk::Result::ERROR_OUT_OF_HOST_MEMORY => {
+                    Error::MemoryExhaustion
+                }
+                _ => Error::UnknownVk(e),
+            })?;
+            Ok(CommandBufferEncoder { cb: self })
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct EncodedCommandBuffer {
+        cb: RaiiCommandBuffer,
+    }
+
+    #[derive(Error, Debug)]
+    pub enum FinishEncodingError {
+        #[error("Exhausted Memory")]
+        MemoryExhaustion,
+        #[error("Unknown Vulkan Error {0}")]
+        UnknownVulkan(vk::Result),
+    }
+
+    impl CommandBufferEncoder {
+        pub fn finish(self) -> Result<EncodedCommandBuffer, FinishEncodingError> {
+            use FinishEncodingError as Error;
+
+            //SAFETY: Being in a CommandBufferEncoder means that we are
+            //recording the command buffer. This ends that recording. self.cb is
+            //a valid RaiiCommandBuffer
+            unsafe {
+                self.cb
+                    .parent_pool
+                    .parent_device
+                    .inner()
+                    .end_command_buffer(self.cb.inner)
+            }
+            .map_err(|e| match e {
+                vk::Result::ERROR_OUT_OF_HOST_MEMORY | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY => {
+                    Error::MemoryExhaustion
+                }
+                _ => Error::UnknownVulkan(e),
+            })?;
+
+            Ok(EncodedCommandBuffer { cb: self.cb })
         }
     }
 }
@@ -956,7 +1172,7 @@ pub mod device {
         /// Handle to the queue we will submit graphics to
         _graphics_queue: vk::Queue,
         /// Index of the graphics queue family
-        _graphics_queue_index: u32,
+        graphics_queue_family_index: u32,
     }
 
     impl PartialEq for Device {
@@ -965,7 +1181,7 @@ pub mod device {
             let handle_eq = self.device.handle() == other.device.handle();
             let phys_dev_eq = self.phys_dev == other.phys_dev;
             let gq_eq = self._graphics_queue == other._graphics_queue;
-            let gqi_eq = self._graphics_queue_index == other._graphics_queue_index;
+            let gqi_eq = self.graphics_queue_family_index == other.graphics_queue_family_index;
             parent_eq && handle_eq && phys_dev_eq && gq_eq && gqi_eq
         }
     }
@@ -1030,6 +1246,9 @@ pub mod device {
         formats: Vec<vk::SurfaceFormatKHR>,
     }
     impl Device {
+        pub fn get_graphics_queue_family_index(&self) -> u32 {
+            self.graphics_queue_family_index
+        }
         ///Get a reference to the parent instance
         pub(super) fn get_parent(&self) -> &Instance {
             &self.parent
@@ -1274,7 +1493,7 @@ pub mod device {
                 debug_utils_fps,
                 phys_dev: scored_phys_dev.phys_dev,
                 _graphics_queue: graphics_queue,
-                _graphics_queue_index: scored_phys_dev.graphics_qfi,
+                graphics_queue_family_index: scored_phys_dev.graphics_qfi,
             })
         }
 

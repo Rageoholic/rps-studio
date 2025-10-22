@@ -22,6 +22,7 @@ use app_dirs2::AppInfo;
 
 use clap::Parser;
 
+use thiserror::Error;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use winit::{
     application::ApplicationHandler, event::WindowEvent, event_loop,
@@ -212,132 +213,157 @@ impl AppRunner {
 const VERT_SHADER_SOURCE: &str = include_str!("shader.vert");
 ///Fragment shader source
 const FRAG_SHADER_SOURCE: &str = include_str!("shader.frag");
+
+#[derive(Debug, Error)]
+enum InitializeStateError {
+    #[error("Error creating window: {0}")]
+    WindowCreation(winit::error::OsError),
+    #[error("Error creating surface: {0}")]
+    SurfaceCreation(rvk::surface::SurfaceCreateError),
+    #[error("Error creating device: {0}")]
+    DeviceCreation(rvk::device::DeviceCreateError),
+    #[error("Error creating swapchain: {0}")]
+    SwapchainCreation(rvk::swapchain::SwapchainCreateError),
+    #[error("Error creating shader compiler: {0}")]
+    ShaderCompilerCreation(rvk::shader::ShaderCompilerError),
+    #[error("Error compiling shader {path} {e}")]
+    ShaderCompilation {
+        e: rvk::shader::ShaderCompileError,
+        path: PathBuf,
+    },
+    #[error("Error creating pipeline layout {0}")]
+    PipelineLayoutCreation(rvk::pipeline::PipelineLayoutCreateError),
+    #[error("Error creating pipeline {0}")]
+    PiplineCreation(rvk::pipeline::PipelineCreateError),
+    #[error("Error creating command pool {0}")]
+    CommandPoolCreation(rvk::command_buffers::CommandPoolCreateError),
+}
+
+impl From<rvk::swapchain::SwapchainCreateError> for InitializeStateError {
+    fn from(value: rvk::swapchain::SwapchainCreateError) -> Self {
+        Self::SwapchainCreation(value)
+    }
+}
+
+impl From<rvk::surface::SurfaceCreateError> for InitializeStateError {
+    fn from(value: rvk::surface::SurfaceCreateError) -> Self {
+        Self::SurfaceCreation(value)
+    }
+}
+
+impl From<rvk::device::DeviceCreateError> for InitializeStateError {
+    fn from(value: rvk::device::DeviceCreateError) -> Self {
+        Self::DeviceCreation(value)
+    }
+}
+
+impl From<rvk::shader::ShaderCompilerError> for InitializeStateError {
+    fn from(value: rvk::shader::ShaderCompilerError) -> Self {
+        Self::ShaderCompilerCreation(value)
+    }
+}
+#[allow(clippy::result_large_err, reason = "In dev")]
+fn initialize_state(
+    uninit_state: UninitState,
+    event_loop: &event_loop::ActiveEventLoop,
+) -> Result<RunningState, InitializeStateError> {
+    use InitializeStateError as Error;
+    let instance = uninit_state.instance;
+    let win_attributes = Window::default_attributes()
+        .with_resizable(true)
+        .with_visible(false);
+    let win = Arc::new(
+        event_loop
+            .create_window(win_attributes)
+            .map_err(Error::WindowCreation)?,
+    );
+
+    let surface = Arc::new(Surface::from_winit_window(&win, &instance)?);
+    let device = Arc::new(Device::create_compatible(
+        &instance,
+        &surface,
+        Version::new(1, 3, 0),
+    )?);
+
+    let src_dir = Path::new(file!()).parent().unwrap();
+    let vert_shader_source_loc: PathBuf = [src_dir, Path::new("shader.vert")].iter().collect();
+    let frag_shader_source_loc: PathBuf = [src_dir, Path::new("shader.frag")].iter().collect();
+
+    let swapchain = Arc::new(Swapchain::create(&device, &surface, None)?);
+
+    let mut shader_compiler =
+        ShaderCompiler::new(&device, ShaderDebugLevel::Full, ShaderOptLevel::None)?;
+
+    let vert_shader = Arc::new(
+        shader_compiler
+            .compile_shader(
+                VERT_SHADER_SOURCE,
+                ShaderType::Vertex,
+                Some(vert_shader_source_loc.clone()).as_deref(),
+            )
+            .map_err(|e| Error::ShaderCompilation {
+                e,
+                path: vert_shader_source_loc.clone(),
+            })?,
+    );
+
+    let frag_shader = Arc::new(
+        shader_compiler
+            .compile_shader(
+                FRAG_SHADER_SOURCE,
+                ShaderType::Fragment,
+                Some(frag_shader_source_loc.clone()).as_deref(),
+            )
+            .map_err(|e| Error::ShaderCompilation {
+                e,
+                path: frag_shader_source_loc.clone(),
+            })?,
+    );
+    let pipeline_layout =
+        Arc::new(PipelineLayout::new(&device).map_err(Error::PipelineLayoutCreation)?);
+
+    let pipeline = Arc::new(
+        DynamicPipeline::new(
+            &device,
+            &pipeline_layout,
+            &swapchain,
+            &vert_shader,
+            &frag_shader,
+        )
+        .map_err(Error::PiplineCreation)?,
+    );
+
+    let command_pool = Arc::new(
+        rvk::command_buffers::CommandPool::new(&device, device.get_graphics_queue_family_index())
+            .map_err(Error::CommandPoolCreation)?,
+    );
+
+    const MAX_FRAMES_IN_FLIGHT: u32 = 3;
+    let _command_buffers = command_pool.allocate_command_buffers(MAX_FRAMES_IN_FLIGHT);
+    win.set_visible(true);
+
+    Ok(RunningState {
+        win,
+        instance,
+        surface,
+        device,
+        swapchain,
+        pipeline_layout,
+        _pipeline: pipeline,
+        vert_shader,
+        frag_shader,
+    })
+}
 impl ApplicationHandler for AppRunner {
     fn resumed(&mut self, event_loop: &event_loop::ActiveEventLoop) {
-        if let Some(UninitState { instance }) = self.take_uninit() {
-            let win_attributes = Window::default_attributes()
-                .with_resizable(true)
-                .with_visible(false);
-            let win = Arc::new(match event_loop.create_window(win_attributes) {
-                Ok(win) => win,
+        if let Some(uninit_state) = self.take_uninit() {
+            self.app_state = match initialize_state(uninit_state, event_loop) {
+                Ok(s) => Some(AppState::Running(s)),
                 Err(e) => {
-                    tracing::error!("Could not create window: Error {}", e);
-                    event_loop.exit();
-                    return;
+                    tracing::error!("{}", e);
+                    return event_loop.exit();
                 }
-            });
-
-            let surface = match Surface::from_winit_window(&win, &instance) {
-                Ok(s) => Arc::new(s),
-                Err(e) => {
-                    tracing::error!("Could not create surface: Error {}", e);
-                    event_loop.exit();
-                    return;
-                }
-            };
-            let device = match Device::create_compatible(&instance, &surface, Version::new(1, 3, 0))
-            {
-                Ok(d) => Arc::new(d),
-                Err(e) => {
-                    tracing::error!("Could not create device: Error {}", e);
-                    event_loop.exit();
-                    return;
-                }
-            };
-
-            let src_dir = Path::new(file!()).parent().unwrap();
-            let vert_shader_source_loc: PathBuf =
-                [src_dir, Path::new("shader.vert")].iter().collect();
-            let frag_shader_source_loc: PathBuf =
-                [src_dir, Path::new("shader.frag")].iter().collect();
-
-            let swapchain = Arc::new(match Swapchain::create(&device, &surface, None) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("Could not create swapchain: Error {}", e);
-                    event_loop.exit();
-                    return;
-                }
-            });
-
-            let mut shader_compiler =
-                match ShaderCompiler::new(&device, ShaderDebugLevel::Full, ShaderOptLevel::None) {
-                    Ok(sc) => sc,
-                    Err(e) => {
-                        tracing::error!("Could not create shader compiler: Error {}", e);
-                        event_loop.exit();
-                        return;
-                    }
-                };
-
-            let vert_shader = Arc::new(
-                match shader_compiler.compile_shader(
-                    VERT_SHADER_SOURCE,
-                    ShaderType::Vertex,
-                    Some(vert_shader_source_loc).as_deref(),
-                ) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!("Could not create vert shader: Error {}", e);
-                        event_loop.exit();
-                        return;
-                    }
-                },
-            );
-
-            let frag_shader = Arc::new(
-                match shader_compiler.compile_shader(
-                    FRAG_SHADER_SOURCE,
-                    ShaderType::Fragment,
-                    Some(frag_shader_source_loc).as_deref(),
-                ) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!("Could not create frag shader: Error {}", e);
-                        event_loop.exit();
-                        return;
-                    }
-                },
-            );
-            let pipeline_layout = Arc::new(match PipelineLayout::new(&device) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::error!("Could not create pipeline layout: Error {}", e);
-                    event_loop.exit();
-                    return;
-                }
-            });
-
-            let pipeline = Arc::new(
-                match DynamicPipeline::new(
-                    &device,
-                    &pipeline_layout,
-                    &swapchain,
-                    &vert_shader,
-                    &frag_shader,
-                ) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::error!("Could not create pipeline: Error {}", e);
-                        event_loop.exit();
-                        return;
-                    }
-                },
-            );
-
-            win.set_visible(true);
-
-            self.app_state = Some(AppState::Running(RunningState {
-                win,
-                instance,
-                surface,
-                device,
-                swapchain,
-                pipeline_layout,
-                _pipeline: pipeline,
-                vert_shader,
-                frag_shader,
-            }))
+            }
         } else if let Some(SuspendedState {
             win,
             instance,
