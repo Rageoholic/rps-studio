@@ -14,6 +14,7 @@
 use core::fmt::Debug;
 use std::{
     fs::File,
+    io::{stderr, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -38,6 +39,8 @@ use rvk::{
     swapchain::Swapchain,
 };
 
+use crate::rvk::shader::ShaderCompileError;
+
 /// Our app info for app_dirs2
 const APP_INFO: AppInfo = AppInfo {
     name: "rps-studio",
@@ -61,6 +64,8 @@ struct RunningState {
     _pipeline: Arc<DynamicPipeline>,
     vert_shader: Arc<Shader>,
     frag_shader: Arc<Shader>,
+    command_buffers: Vec<rvk::command_buffers::RaiiCommandBuffer>,
+    shader_compiler_log_file: File,
 }
 
 /// State of the application while suspended
@@ -75,6 +80,8 @@ struct SuspendedState {
     pipeline_layout: Arc<PipelineLayout>,
     vert_shader: Arc<Shader>,
     frag_shader: Arc<Shader>,
+    command_buffers: Vec<rvk::command_buffers::RaiiCommandBuffer>,
+    shader_compiler_log_file: File,
 }
 
 /// State of the app before initialization
@@ -83,6 +90,7 @@ struct UninitState {
     /// Our vk instance (contains pre-initialization stuff safe to make before
     /// we have a window)
     instance: Arc<Instance>,
+    shader_compiler_log_file: File,
 }
 
 /// Enumeration of the app state. Represents an FSM
@@ -237,6 +245,8 @@ enum InitializeStateError {
     PiplineCreation(rvk::pipeline::PipelineCreateError),
     #[error("Error creating command pool {0}")]
     CommandPoolCreation(rvk::command_buffers::CommandPoolCreateError),
+    #[error("Error allocating command buffers: {0}")]
+    CommandBufferAllocation(rvk::command_buffers::AllocateCommandBuffersError),
 }
 
 impl From<rvk::swapchain::SwapchainCreateError> for InitializeStateError {
@@ -287,7 +297,9 @@ fn initialize_state(
 
     let src_dir = Path::new(file!()).parent().unwrap();
     let vert_shader_source_loc: PathBuf = [src_dir, Path::new("shader.vert")].iter().collect();
+    let vert_shader_source_loc = std::path::absolute(vert_shader_source_loc).unwrap();
     let frag_shader_source_loc: PathBuf = [src_dir, Path::new("shader.frag")].iter().collect();
+    let frag_shader_source_loc = std::path::absolute(frag_shader_source_loc).unwrap();
 
     let swapchain = Arc::new(Swapchain::create(&device, &surface, None)?);
 
@@ -339,7 +351,9 @@ fn initialize_state(
     );
 
     const MAX_FRAMES_IN_FLIGHT: u32 = 3;
-    let _command_buffers = command_pool.allocate_command_buffers(MAX_FRAMES_IN_FLIGHT);
+    let command_buffers = command_pool
+        .allocate_command_buffers(MAX_FRAMES_IN_FLIGHT)
+        .map_err(Error::CommandBufferAllocation)?;
     win.set_visible(true);
 
     Ok(RunningState {
@@ -352,13 +366,69 @@ fn initialize_state(
         _pipeline: pipeline,
         vert_shader,
         frag_shader,
+        command_buffers,
+        shader_compiler_log_file: uninit_state.shader_compiler_log_file,
     })
 }
 impl ApplicationHandler for AppRunner {
     fn resumed(&mut self, event_loop: &event_loop::ActiveEventLoop) {
         if let Some(uninit_state) = self.take_uninit() {
+            let mut shader_compiler_log_file =
+                uninit_state.shader_compiler_log_file.try_clone().unwrap();
             self.app_state = match initialize_state(uninit_state, event_loop) {
                 Ok(s) => Some(AppState::Running(s)),
+                Err(InitializeStateError::ShaderCompilation {
+                    e:
+                        ShaderCompileError::Parse {
+                            e,
+                            src,
+                            file: Some(p),
+                        },
+                    ..
+                }) => {
+                    if let Some(p) = p.to_str() {
+                        tracing::error!(
+                            "Error compiling shader {}. Outputing to stderr \
+                            and to shader compiler logging file",
+                            p
+                        );
+                        e.emit_to_writer_with_path(&mut termcolor::Ansi::new(stderr()), &src, p);
+                        _ = writeln!(
+                            shader_compiler_log_file,
+                            "Error compiling shader {} at time {}:",
+                            p,
+                            chrono::Local::now()
+                        );
+                        e.emit_to_writer_with_path(
+                            &mut termcolor::NoColor::new(shader_compiler_log_file),
+                            &src,
+                            p,
+                        );
+                    } else {
+                        tracing::error!(
+                            "Error compiling unknown shader. Outputing to stderr \
+                            and to shader compiler logging file"
+                        );
+                        e.emit_to_writer(&mut termcolor::Ansi::new(stderr()), &src);
+                        _ = writeln!(
+                            shader_compiler_log_file,
+                            "Error compiling unknown shader at time {}. Printing Source",
+                            chrono::Local::now()
+                        );
+                        _ = writeln!(shader_compiler_log_file, "{}", &src);
+                        let _ = writeln!(
+                            shader_compiler_log_file,
+                            "\nNow printing \
+                             errors:"
+                        );
+                        e.emit_to_writer(
+                            &mut termcolor::NoColor::new(shader_compiler_log_file),
+                            &src,
+                        );
+                    }
+
+                    return event_loop.exit();
+                }
                 Err(e) => {
                     tracing::error!("{}", e);
                     return event_loop.exit();
@@ -371,6 +441,8 @@ impl ApplicationHandler for AppRunner {
             pipeline_layout,
             vert_shader,
             frag_shader,
+            command_buffers,
+            shader_compiler_log_file,
         }) = self.take_suspended()
         {
             let surface = match Surface::from_winit_window(&win, &instance) {
@@ -416,6 +488,8 @@ impl ApplicationHandler for AppRunner {
                 _pipeline: pipeline,
                 vert_shader,
                 frag_shader,
+                command_buffers,
+                shader_compiler_log_file,
             }));
         }
 
@@ -433,6 +507,8 @@ impl ApplicationHandler for AppRunner {
             _pipeline: _,
             vert_shader,
             frag_shader,
+            command_buffers,
+            shader_compiler_log_file,
         }) = self.take_running()
         {
             event_loop.set_control_flow(event_loop::ControlFlow::Wait);
@@ -443,6 +519,8 @@ impl ApplicationHandler for AppRunner {
                 pipeline_layout,
                 vert_shader,
                 frag_shader,
+                command_buffers,
+                shader_compiler_log_file,
             }))
         }
 
@@ -454,18 +532,7 @@ impl ApplicationHandler for AppRunner {
         window_id: winit::window::WindowId,
         event: winit::event::WindowEvent,
     ) {
-        if let Some(RunningState {
-            win,
-            instance: _,
-            surface: _,
-            device: _,
-            swapchain: _,
-            pipeline_layout: _,
-            _pipeline: _,
-            vert_shader: _,
-            frag_shader: _,
-        }) = self.as_running_mut()
-        {
+        if let Some(RunningState { win, .. }) = self.as_running_mut() {
             if win.id() == window_id {
                 match event {
                     WindowEvent::CloseRequested if window_id == win.id() => {
@@ -522,6 +589,8 @@ impl ApplicationHandler for AppRunner {
                             _pipeline: new_pipeline,
                             vert_shader: state.vert_shader,
                             frag_shader: state.frag_shader,
+                            command_buffers: state.command_buffers,
+                            shader_compiler_log_file: state.shader_compiler_log_file,
                         }));
                     }
 
@@ -551,7 +620,11 @@ fn main() -> eyre::Result<()> {
     let app_data_dir = app_dirs2::app_root(app_dirs2::AppDataType::UserData, &APP_INFO)?;
 
     let log_target_file: PathBuf = [app_data_dir.clone(), "LOG.txt".into()].iter().collect();
-
+    let shader_compiler_error_log_file_path: PathBuf =
+        [app_data_dir.clone(), "SHADER_COMPILER_ERROR.txt".into()]
+            .iter()
+            .collect();
+    let shader_compiler_log_file = File::create(shader_compiler_error_log_file_path).unwrap();
     eprintln!(
         "Logging at {}",
         log_target_file.as_os_str().to_str().unwrap()
@@ -559,7 +632,7 @@ fn main() -> eyre::Result<()> {
 
     let (log_target, _guard) = tracing_appender::non_blocking(File::create(log_target_file)?);
 
-    let main_layer = tracing_subscriber::fmt::layer()
+    let term_layer = tracing_subscriber::fmt::layer()
         .with_line_number(true)
         .with_file(true)
         .with_thread_ids(true)
@@ -574,7 +647,7 @@ fn main() -> eyre::Result<()> {
         .with_target(true)
         .with_writer(log_target);
     tracing_subscriber::registry()
-        .with(main_layer)
+        .with(term_layer)
         .with(file_layer)
         .with(tracing_subscriber::filter::LevelFilter::from_level(
             args.log_level,
@@ -591,7 +664,10 @@ fn main() -> eyre::Result<()> {
             .expect("Couldn't get display handle"),
     )?);
 
-    let mut app = AppRunner::new(UninitState { instance });
+    let mut app = AppRunner::new(UninitState {
+        instance,
+        shader_compiler_log_file,
+    });
     event_loop.run_app(&mut app)?;
     Ok(())
 }

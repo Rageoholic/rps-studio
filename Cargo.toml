@@ -7,6 +7,7 @@ edition = "2021"
 app_dirs2 = "2.5"
 ash = "0.38"
 ash-window = "0.13.0"
+chrono = "0.4.42"
 clap = { version = "4.5", features = ["derive"] }
 eyre = "0.6"
 naga = { version = "25", features = ["glsl-in", "spv-out"] }

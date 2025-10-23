@@ -201,9 +201,12 @@ pub mod pipeline {
 }
 
 pub mod command_buffers {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        fmt::Display,
+        sync::{Arc, Mutex},
+    };
 
-    use ash::vk;
+    use ash::vk::{self, Handle};
     use thiserror::Error;
 
     use crate::rvk::{device::Device, LockResultExt};
@@ -244,19 +247,25 @@ pub mod command_buffers {
             count: u32,
         ) -> Result<Vec<RaiiCommandBuffer>, AllocateCommandBuffersError> {
             use AllocateCommandBuffersError as Error;
+            use AllocateCommandBuffersErrorType as ErrorType;
             // Get exclusive access to the pool
             let pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+            let pool = *pool;
             let cbai = vk::CommandBufferAllocateInfo::default()
-                .command_pool(*pool)
+                .command_pool(pool)
                 .command_buffer_count(count);
 
             //SAFETY: pool comes from parent device, have exclusive access,
             //valid allocate_info
             let cbs = unsafe { self.parent_device.inner().allocate_command_buffers(&cbai) }
-                .map_err(|e| match e {
-                    vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
-                    | vk::Result::ERROR_OUT_OF_HOST_MEMORY => Error::MemoryExhaustion,
-                    _ => Error::UnknownVk(e),
+                .map_err(|e| Error {
+                    e: match e {
+                        vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
+                        | vk::Result::ERROR_OUT_OF_HOST_MEMORY => ErrorType::MemoryExhaustion,
+                        _ => ErrorType::UnknownVk(e),
+                    },
+                    count,
+                    pool,
                 })?;
 
             Ok(cbs
@@ -280,8 +289,27 @@ pub mod command_buffers {
         }
     }
 
-    #[derive(Error, Debug)]
-    pub enum AllocateCommandBuffersError {
+    #[derive(Debug, Error)]
+    pub struct AllocateCommandBuffersError {
+        count: u32,
+        pool: vk::CommandPool,
+        e: AllocateCommandBuffersErrorType,
+    }
+
+    impl Display for AllocateCommandBuffersError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "Error while allocating {} command buffers from pool {}: {}",
+                self.count,
+                self.pool.as_raw(),
+                self.e
+            )
+        }
+    }
+
+    #[derive(Debug, Error)]
+    pub enum AllocateCommandBuffersErrorType {
         #[error("Could not allocate due to memory exhaustion")]
         MemoryExhaustion,
         #[error("Unknown vulkan error {0}")]
@@ -1614,12 +1642,13 @@ pub mod shader {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
                 ShaderCompileError::Parse { e, src, file } => {
-                    f.write_str(&format!(
-                        "Could not create shader {} due to parse error.\n",
+                    writeln!(
+                        f,
+                        "Could not create shader {} due to parse error.",
                         file.as_ref()
                             .and_then(|p| p.to_str())
-                            .unwrap_or("<Unknown>")
-                    ))?;
+                            .unwrap_or("<unknown>")
+                    )?;
                     f.write_str(&e.emit_to_string(src))?;
                     Ok(())
                 }
