@@ -1768,17 +1768,14 @@ pub mod shader {
                 parent_device: device.clone(),
             })
         }
-        #[expect(
-            clippy::result_large_err,
-            reason = "I will figure out large results later"
-        )]
+
         /// Create a shader object from its source and optionally its path
         pub fn compile_shader(
             &mut self,
             source: &str,
             shader_type: ShaderType,
             file_path: Option<&Path>,
-        ) -> Result<Shader, ShaderCompileError> {
+        ) -> Result<Shader, Box<ShaderCompileError>> {
             let shader_mod = self
                 .glsl_parser
                 .parse(&glsl::Options::from(shader_type.to_naga_stage()), source)

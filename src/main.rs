@@ -234,11 +234,8 @@ enum InitializeStateError {
     SwapchainCreation(rvk::swapchain::SwapchainCreateError),
     #[error("Error creating shader compiler: {0}")]
     ShaderCompilerCreation(rvk::shader::ShaderCompilerError),
-    #[error("Error compiling shader {path} {e}")]
-    ShaderCompilation {
-        e: rvk::shader::ShaderCompileError,
-        path: PathBuf,
-    },
+    #[error("Error compiling shader {0}")]
+    ShaderCompilation(Box<rvk::shader::ShaderCompileError>),
     #[error("Error creating pipeline layout {0}")]
     PipelineLayoutCreation(rvk::pipeline::PipelineLayoutCreateError),
     #[error("Error creating pipeline {0}")]
@@ -270,6 +267,12 @@ impl From<rvk::device::DeviceCreateError> for InitializeStateError {
 impl From<rvk::shader::ShaderCompilerError> for InitializeStateError {
     fn from(value: rvk::shader::ShaderCompilerError) -> Self {
         Self::ShaderCompilerCreation(value)
+    }
+}
+
+impl From<Box<rvk::shader::ShaderCompileError>> for InitializeStateError {
+    fn from(value: Box<rvk::shader::ShaderCompileError>) -> Self {
+        Self::ShaderCompilation(value)
     }
 }
 #[allow(clippy::result_large_err, reason = "In dev")]
@@ -306,31 +309,17 @@ fn initialize_state(
     let mut shader_compiler =
         ShaderCompiler::new(&device, ShaderDebugLevel::Full, ShaderOptLevel::None)?;
 
-    let vert_shader = Arc::new(
-        shader_compiler
-            .compile_shader(
-                VERT_SHADER_SOURCE,
-                ShaderType::Vertex,
-                Some(vert_shader_source_loc.clone()).as_deref(),
-            )
-            .map_err(|e| Error::ShaderCompilation {
-                e,
-                path: vert_shader_source_loc.clone(),
-            })?,
-    );
+    let vert_shader = Arc::new(shader_compiler.compile_shader(
+        VERT_SHADER_SOURCE,
+        ShaderType::Vertex,
+        Some(vert_shader_source_loc.clone()).as_deref(),
+    )?);
 
-    let frag_shader = Arc::new(
-        shader_compiler
-            .compile_shader(
-                FRAG_SHADER_SOURCE,
-                ShaderType::Fragment,
-                Some(frag_shader_source_loc.clone()).as_deref(),
-            )
-            .map_err(|e| Error::ShaderCompilation {
-                e,
-                path: frag_shader_source_loc.clone(),
-            })?,
-    );
+    let frag_shader = Arc::new(shader_compiler.compile_shader(
+        FRAG_SHADER_SOURCE,
+        ShaderType::Fragment,
+        Some(frag_shader_source_loc.clone()).as_deref(),
+    )?);
     let pipeline_layout =
         Arc::new(PipelineLayout::new(&device).map_err(Error::PipelineLayoutCreation)?);
 
@@ -377,56 +366,58 @@ impl ApplicationHandler for AppRunner {
                 uninit_state.shader_compiler_log_file.try_clone().unwrap();
             self.app_state = match initialize_state(uninit_state, event_loop) {
                 Ok(s) => Some(AppState::Running(s)),
-                Err(InitializeStateError::ShaderCompilation {
-                    e:
-                        ShaderCompileError::Parse {
-                            e,
-                            src,
-                            file: Some(p),
-                        },
-                    ..
-                }) => {
-                    if let Some(p) = p.to_str() {
-                        tracing::error!(
-                            "Error compiling shader {}. Outputing to stderr \
+                Err(InitializeStateError::ShaderCompilation(e)) => {
+                    match *e {
+                        ShaderCompileError::Parse { e, src, file } => {
+                            if let Some(p) = file.as_ref().and_then(|p| p.to_str()) {
+                                tracing::error!(
+                                    "Error compiling shader {}. Outputing to stderr \
                             and to shader compiler logging file",
-                            p
-                        );
-                        e.emit_to_writer_with_path(&mut termcolor::Ansi::new(stderr()), &src, p);
-                        _ = writeln!(
-                            shader_compiler_log_file,
-                            "Error compiling shader {} at time {}:",
-                            p,
-                            chrono::Local::now()
-                        );
-                        e.emit_to_writer_with_path(
-                            &mut termcolor::NoColor::new(shader_compiler_log_file),
-                            &src,
-                            p,
-                        );
-                    } else {
-                        tracing::error!(
-                            "Error compiling unknown shader. Outputing to stderr \
+                                    p
+                                );
+                                e.emit_to_writer_with_path(
+                                    &mut termcolor::Ansi::new(stderr()),
+                                    &src,
+                                    p,
+                                );
+                                _ = writeln!(
+                                    shader_compiler_log_file,
+                                    "Error compiling shader {} at time {}:",
+                                    p,
+                                    chrono::Local::now()
+                                );
+                                e.emit_to_writer_with_path(
+                                    &mut termcolor::NoColor::new(shader_compiler_log_file),
+                                    &src,
+                                    p,
+                                );
+                            } else {
+                                tracing::error!(
+                                    "Error compiling unknown shader. Outputing to stderr \
                             and to shader compiler logging file"
-                        );
-                        e.emit_to_writer(&mut termcolor::Ansi::new(stderr()), &src);
-                        _ = writeln!(
-                            shader_compiler_log_file,
-                            "Error compiling unknown shader at time {}. Printing Source",
-                            chrono::Local::now()
-                        );
-                        _ = writeln!(shader_compiler_log_file, "{}", &src);
-                        let _ = writeln!(
-                            shader_compiler_log_file,
-                            "\nNow printing \
+                                );
+                                e.emit_to_writer(&mut termcolor::Ansi::new(stderr()), &src);
+                                _ = writeln!(
+                                    shader_compiler_log_file,
+                                    "Error compiling unknown shader at time {}. Printing Source",
+                                    chrono::Local::now()
+                                );
+                                _ = writeln!(shader_compiler_log_file, "{}", &src);
+                                let _ = writeln!(
+                                    shader_compiler_log_file,
+                                    "\nNow printing \
                              errors:"
-                        );
-                        e.emit_to_writer(
-                            &mut termcolor::NoColor::new(shader_compiler_log_file),
-                            &src,
-                        );
+                                );
+                                e.emit_to_writer(
+                                    &mut termcolor::NoColor::new(shader_compiler_log_file),
+                                    &src,
+                                );
+                            }
+                        }
+                        _ => {
+                            tracing::error!("Error when compiling shader: {}", e)
+                        }
                     }
-
                     return event_loop.exit();
                 }
                 Err(e) => {
