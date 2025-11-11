@@ -3,6 +3,47 @@
 	"tasks": [
 		{
 			"type": "cargo",
+			"command": "check",
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			},
+			"label": "rust: cargo check"
+		},
+		{
+			"type": "cargo",
+			"command": "clippy",
+			"args": [
+				"--all-targets",
+				"--all-features",
+				"--",
+				"-D",
+				"warnings"
+			],
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": {
+				"kind": "build",
+				"isDefault": false
+			},
+			"label": "rust: cargo clippy"
+		},
+		{
+			"label": "rust: lint & check",
+			"dependsOn": [
+				"rust: cargo clippy",
+				"rust: cargo check"
+			],
+			"group": "build",
+			"type": "shell",
+			"command": "echo Lint and check task"
+		},
+		{
+			"type": "cargo",
 			"command": "build",
 			"problemMatcher": [
 				"$rustc"
@@ -19,7 +60,7 @@
 			"label": "rust: cargo run",
 			"group": {
 				"kind": "build",
-				"isDefault": true
+				"isDefault": false
 			}
 		},
 		{
@@ -66,6 +107,6 @@
 			"args": [
 				"--release"
 			]
-		},
+		}
 	]
 }
