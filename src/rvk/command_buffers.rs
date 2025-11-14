@@ -263,7 +263,7 @@ impl RecordingCommandBuffer {
     /// Transition the swapchain image into a layout suitable for color
     /// attachment rendering (COLOR_ATTACHMENT_OPTIMAL).
     pub fn transition_swapchain_image_for_rendering(
-        &self,
+        &mut self,
         swapchain: &crate::rvk::swapchain::Swapchain,
         image_index: u32,
     ) {
@@ -301,7 +301,7 @@ impl RecordingCommandBuffer {
     /// Clear the color of the given swapchain image (assumes it's in
     /// COLOR_ATTACHMENT_OPTIMAL layout).
     pub fn clear_color_attachment(
-        &self,
+        &mut self,
         swapchain: &crate::rvk::swapchain::Swapchain,
         image_index: u32,
         color: [f32; 4],
@@ -330,7 +330,7 @@ impl RecordingCommandBuffer {
 
     /// Transition the swapchain image into PRESENT_SRC_KHR for presentation.
     pub fn transition_swapchain_image_for_presenting(
-        &self,
+        &mut self,
         swapchain: &crate::rvk::swapchain::Swapchain,
         image_index: u32,
     ) {
@@ -368,7 +368,7 @@ impl RecordingCommandBuffer {
     /// state (viewport/scissor), binding pipelines and issuing draw calls.
     /// The returned helper will end the dynamic rendering in its Drop impl.
     pub fn begin_rendering_clear_color<'a>(
-        &'a self,
+        &'a mut self,
         swapchain: &crate::rvk::swapchain::Swapchain,
         image_index: u32,
         clear_color: vek::Vec4<f32>,

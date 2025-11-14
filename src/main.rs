@@ -684,7 +684,6 @@ impl ApplicationHandler for AppRunner {
 
                     WindowEvent::RedrawRequested => {
                         if let Some(state) = self.as_running_mut() {
-                            state.win.request_redraw();
                             match state.redraw() {
                                 Ok(DrawStatus { suboptimal }) => {
                                     if suboptimal {
@@ -692,6 +691,7 @@ impl ApplicationHandler for AppRunner {
                                             "Redraw completed but swapchain marked SUBOPTIMAL"
                                         );
                                     }
+                                    state.win.request_redraw();
                                 }
                                 Err(e) => {
                                     tracing::error!("Error during redraw: {}", e);
@@ -752,7 +752,7 @@ impl RunningState {
 
             let cb = frame.command_pool.allocate_command_buffer_primary()?;
 
-            let cb_recorder = cb.begin_one_time()?;
+            let mut cb_recorder = cb.begin_one_time()?;
             cb_recorder.transition_swapchain_image_for_rendering(swapchain, image_index);
 
             let renderer = cb_recorder.begin_rendering_clear_color(
