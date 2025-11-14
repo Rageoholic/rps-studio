@@ -108,7 +108,7 @@ impl Swapchain {
             .find(|pm| **pm == PresentModeKHR::MAILBOX)
             .copied()
             .unwrap_or_else(|| {
-                tracing::warn!(
+                tracing::debug!(
                     "preferred present mode MAILBOX not available; falling back to FIFO"
                 );
                 PresentModeKHR::FIFO
@@ -141,7 +141,7 @@ impl Swapchain {
             }
         };
         if swapchain_extent.width == 0 || swapchain_extent.height == 0 {
-            tracing::warn!("Swapchain extent has zero width or height; returning None");
+            tracing::debug!("Swapchain extent has zero width or height; returning None");
             return Ok(None);
         }
 

@@ -69,5 +69,19 @@ impl Version {
     }
 }
 
+#[derive(clap::Parser, Debug)]
+/// Argument parser exposed from the library so other crates (including the
+/// binary) can parse CLI arguments using the same definition.
+pub struct Args {
+    // TODO: Configure default to change based on build personality
+    #[arg(short, long, default_value_t = crate::rvk::instance::VulkanDebugLevel::Warn)]
+    /// What level to run validation layers at
+    pub vulkan_debug_level: crate::rvk::instance::VulkanDebugLevel,
+
+    #[arg(short, long, default_value_t = tracing::Level::WARN)]
+    /// What level to run Rust's logging at
+    pub log_level: tracing::Level,
+}
+
 // Re-export the rvk module so callers can use `crate::rvk::...`
 pub mod rvk;
