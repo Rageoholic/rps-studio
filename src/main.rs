@@ -8,20 +8,20 @@
     clippy::missing_safety_doc
 )]
 // Uncomment to check for undocumented stuff
-//#![warn(clippy::missing_docs_in_private_items)]
+#![warn(clippy::missing_docs_in_private_items)]
 
 /// Current Top Level crate for our app. Will break up in future
 use core::fmt::Debug;
 use std::{
     fs::File,
-    io::{stderr, Write},
+    io::{Write, stderr},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use app_dirs2::AppInfo;
 
-use clap::Parser;
+use rps_studio::Args;
 
 use thiserror::Error;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -34,16 +34,17 @@ use winit::{
 use rps_studio::rvk::{
     command_buffers::RecordedCommandBuffer,
     device::Device,
-    instance::{Instance, VulkanDebugLevel},
+    instance::Instance,
     pipeline::{DynamicPipeline, PipelineLayout},
     shader::{Shader, ShaderCompiler, ShaderDebugLevel, ShaderOptLevel, ShaderType},
     surface::Surface,
     swapchain::Swapchain,
 };
 
+use clap::Parser;
+use rps_studio::Version;
 use rps_studio::rvk;
 use rps_studio::rvk::shader::ShaderCompileError;
-use rps_studio::Version;
 
 /// Our app info for app_dirs2
 const APP_INFO: AppInfo = AppInfo {
@@ -64,23 +65,91 @@ struct RunningState {
     device: Arc<Device>,
     /// A swapchain we are currently using
     swapchain: Option<Arc<Swapchain>>,
+    /// Pipeline layout used for rendering, effectively a cache
     pipeline_layout: Arc<PipelineLayout>,
+    /// Pipeline used for rendering
     pipeline: Option<Arc<DynamicPipeline>>,
+    /// cached vertex shader
     vert_shader: Arc<Shader>,
+    /// cached fragment shader
     frag_shader: Arc<Shader>,
+    /// Per-frame data for rendering
     frame_data: Vec<FrameData>,
     /// Index of the current frame in `frame_data`
     current_frame_index: usize,
+    /// File to log shader compiler output to
     shader_compiler_log_file: File,
 }
 
+impl SuspendedState {
+    /// Consume the `SuspendedState` and attempt to produce a `RunningState`.
+    ///
+    /// This will recreate the surface, swapchain, pipeline (if applicable),
+    /// and per-frame resources. Any failure will be returned to the caller
+    /// as an `InitializeStateError` so the caller can decide how to proceed.
+    fn try_into_running(self) -> Result<RunningState, InitializeStateError> {
+        use InitializeStateError as Error;
+        let SuspendedState {
+            win,
+            instance,
+            device,
+            pipeline_layout,
+            vert_shader,
+            frag_shader,
+            current_frame,
+            shader_compiler_log_file,
+        } = self;
+
+        let surface = Arc::new(Surface::from_winit_window(&win, &instance)?);
+
+        let swapchain = Swapchain::create(&device, &surface, None)?.map(Arc::new);
+
+        let pipeline = if let Some(ref sc) = swapchain {
+            Some(Arc::new(
+                DynamicPipeline::new(&device, &pipeline_layout, sc, &vert_shader, &frag_shader)
+                    .map_err(Error::PipelineCreation)?,
+            ))
+        } else {
+            None
+        };
+
+        const MAX_FRAMES_IN_FLIGHT: u32 = 3;
+        let mut frame_data = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT as usize);
+        for _ in 0..MAX_FRAMES_IN_FLIGHT {
+            frame_data.push(FrameData::new(&device)?);
+        }
+
+        Ok(RunningState {
+            win,
+            instance,
+            surface,
+            device,
+            swapchain,
+            pipeline_layout,
+            pipeline,
+            vert_shader,
+            frag_shader,
+            frame_data,
+            current_frame_index: current_frame,
+            shader_compiler_log_file,
+        })
+    }
+}
+
 #[derive(Debug)]
+/// Per-frame resources for rendering
 struct FrameData {
+    /// Command pool for this frame
     command_pool: std::sync::Arc<rvk::command_buffers::CommandPool>,
+    /// Fence to track when previous rendering operations using these objects completed
     prev_frame_fence: rvk::sync_objects::Fence,
+    /// Semaphore that signals when an image has been acquired from the swapchain
     acquired_image_semaphore: rvk::sync_objects::Semaphore,
+    /// Semaphore that signals when rendering is complete
     render_complete_semaphore: rvk::sync_objects::Semaphore,
-    prev_frame_ptrs: Option<(Arc<Swapchain>, RecordedCommandBuffer)>,
+    /// place to stash previous frame's resources because they can't be
+    /// destroyed according to vulkan until command buffer execution is complete
+    prev_frame_stash: Option<(Arc<Swapchain>, RecordedCommandBuffer, Arc<DynamicPipeline>)>,
 }
 
 impl Drop for FrameData {
@@ -108,11 +177,15 @@ struct SuspendedState {
     instance: Arc<Instance>,
     /// handle to GPU device
     device: Arc<Device>,
+    /// cached pipeline layout for recreating our pipeline on resume
     pipeline_layout: Arc<PipelineLayout>,
+    /// cached vertex shader for recreating our pipeline on resume
     vert_shader: Arc<Shader>,
+    /// cached fragment shader for recreating our pipeline on resume
     frag_shader: Arc<Shader>,
     /// Preserved current frame index while suspended
     current_frame: usize,
+    /// File to log shader compiler output to
     shader_compiler_log_file: File,
 }
 
@@ -122,6 +195,7 @@ struct UninitState {
     /// Our vk instance (contains pre-initialization stuff safe to make before
     /// we have a window)
     instance: Arc<Instance>,
+    /// File to log shader compiler output to
     shader_compiler_log_file: File,
 }
 
@@ -254,52 +328,114 @@ const VERT_SHADER_SOURCE: &str = include_str!("shader.vert");
 ///Fragment shader source
 const FRAG_SHADER_SOURCE: &str = include_str!("shader.frag");
 
+/// Errors that can occur while initializing the running `State` from an
+/// uninitialized application context. These represent recoverable initialization
+/// failures that should be reported to the user or cause a clean shutdown.
 #[derive(Debug, Error)]
 enum InitializeStateError {
+    /// Failed to create a native window via the windowing backend.
+    ///
+    /// Source: `winit::error::OsError`.
     #[error("Error creating window: {0}")]
     WindowCreation(#[from] winit::error::OsError),
+
+    /// Failed to create a Vulkan `Surface` for the window. This usually
+    /// indicates a platform surface integration issue (e.g. missing display
+    /// handle or unsupported platform).
     #[error("Error creating surface: {0}")]
     SurfaceCreation(#[from] rvk::surface::SurfaceCreateError),
+
+    /// Failed to create or select a compatible Vulkan `Device`/physical
+    /// device. This may indicate missing device support or driver issues.
     #[error("Error creating device: {0}")]
     DeviceCreation(#[from] rvk::device::DeviceCreateError),
+
+    /// Failed to create a swapchain for the surface. May be due to an
+    /// unsupported format, present mode, or out-of-date surface state.
     #[error("Error creating swapchain: {0}")]
     SwapchainCreation(#[from] rvk::swapchain::SwapchainCreateError),
+
+    /// Failed to create the shader compiler (from Naga)
     #[error("Error creating shader compiler: {0}")]
     ShaderCompilerCreation(#[from] rvk::shader::ShaderCompilerError),
+
+    /// Compilation of a shader source failed. The inner error contains
+    /// detailed parse/compile diagnostics from the shader compiler.
     #[error("Error compiling shader {0}")]
     ShaderCompilation(#[from] Box<rvk::shader::ShaderCompileError>),
+
+    /// Failure creating the pipeline layout required for the graphics
+    /// pipeline (descriptor sets, push constant ranges, etc.).
     #[error("Error creating pipeline layout {0}")]
     PipelineLayoutCreation(rvk::pipeline::PipelineLayoutCreateError),
+
+    /// Failure creating the graphics pipeline itself (shader stages,
+    /// render state, pipeline creation errors).
     #[error("Error creating pipeline {0}")]
     PipelineCreation(rvk::pipeline::PipelineCreateError),
+
+    /// Failure creating a command pool used for per-frame command buffer
+    /// allocations.
     #[error("Error creating command pool {0}")]
     CommandPoolCreation(#[from] rvk::command_buffers::CommandPoolCreateError),
 
+    /// Failure creating a fence object used to synchronize GPU work.
     #[error("Error creating fence: {0}")]
     FenceCreation(#[from] rvk::sync_objects::FenceCreateError),
+
+    /// Failure creating a semaphore used for GPU/GPU or CPU/GPU signaling.
     #[error("Error creating semaphore: {0}")]
     SemaphoreCreation(#[from] rvk::sync_objects::SemaphoreCreateError),
 
+    /// Generic I/O error (file operations, path canonicalization, etc.)
+    /// encountered while preparing resources for initialization.
     #[error("IO error: {0}")]
-    /// Generic IO errors (path canonicalize, file ops, etc.)
     Io(#[from] std::io::Error),
 }
 
-/// Errors that can occur during a redraw operation
+/// Errors that can occur while performing a single frame redraw.
+///
+/// These represent errors encountered during the acquire/record/submit/present
+/// flow. The caller may handle some of these (for example, treating
+/// `OutOfDateSwapchain` as a signal to recreate the swapchain) while others
+/// surface as fatal Vulkan errors.
 #[derive(Debug, thiserror::Error)]
 enum RedrawError {
+    /// An unexpected Vulkan error code was returned by an operation.
+    ///
+    /// The contained `ash::vk::Result` provides the exact Vulkan result.
     #[error("Unknown Vulkan error: {0}")]
     UnknownVk(#[from] ash::vk::Result),
+
+    /// The swapchain is out of date and must be recreated before presenting.
+    ///
+    /// This commonly occurs when the window is resized or the surface
+    /// becomes incompatible with the current swapchain configuration.
     #[error("Swapchain is out of date")]
     OutOfDateSwapchain,
+
+    /// No per-frame data was available to perform a redraw.
+    ///
+    /// This indicates an internal state error where `frame_data` is empty.
     #[error("No frame data available")]
     NoFrameData,
+
+    /// Failed to acquire the next swapchain image.
+    ///
+    /// The wrapped `AcquireImageError` contains more specific reasons such
+    /// as timeout, out-of-date, or other Vulkan errors.
     #[error("Failed to acquire next image")]
     AcquireSwapchainImage(#[from] rvk::swapchain::AcquireImageError),
+
+    /// Failed to allocate command buffers required for recording GPU work.
     #[error("Failed to allocate command buffer: {0}")]
     AllocateCommandBuffer(#[from] rvk::command_buffers::AllocateCommandBuffersError),
+
+    /// Failed to submit recorded command buffer(s) to the device queue.
     #[error("Failed to submit command buffer: {0}")]
     Submit(#[from] rvk::device::SubmitError),
+
+    /// Waiting for or resetting the per-frame fence failed.
     #[error("Failed to wait and reset fence: {0}")]
     WaitAndResetFence(#[from] rvk::sync_objects::FenceWaitError),
 }
@@ -321,12 +457,18 @@ impl FrameData {
             prev_frame_fence,
             acquired_image_semaphore,
             render_complete_semaphore,
-            prev_frame_ptrs: None,
+            prev_frame_stash: None,
         })
     }
 }
 
 #[allow(clippy::result_large_err, reason = "In dev")]
+/// Initialize the application `RunningState` from an `UninitState`.
+///
+/// This performs window creation, surface/device selection, shader
+/// compilation, swapchain creation, pipeline setup, and per-frame resource
+/// allocation. Errors are returned as `InitializeStateError` to allow the
+/// caller to report or recover cleanly.
 fn initialize_state(
     uninit_state: UninitState,
     event_loop: &event_loop::ActiveEventLoop,
@@ -482,116 +624,29 @@ impl ApplicationHandler for AppRunner {
                     return event_loop.exit();
                 }
             }
-        } else if let Some(SuspendedState {
-            win,
-            instance,
-            device,
-            pipeline_layout,
-            vert_shader,
-            frag_shader,
-            current_frame,
-            shader_compiler_log_file,
-        }) = self.take_suspended()
-        {
-            let surface = match Surface::from_winit_window(&win, &instance) {
-                Ok(s) => Arc::new(s),
+        } else if let Some(suspended_state) = self.take_suspended() {
+            match suspended_state.try_into_running() {
+                Ok(running) => {
+                    self.app_state = Some(AppState::Running(running));
+                }
                 Err(e) => {
-                    tracing::error!("Could not recreate surface: Error {}", e);
+                    tracing::error!("Failed to resume running state: {}", e);
                     event_loop.exit();
                     return;
-                }
-            };
-            let swapchain = match Swapchain::create(&device, &surface, None) {
-                Ok(s) => s.map(Arc::new),
-                Err(e) => {
-                    tracing::error!("Could not recreate swapchain: Error {}", e);
-                    event_loop.exit();
-                    return;
-                }
-            };
-
-            let pipeline = swapchain.as_ref().map(|swapchain| {
-                Arc::new(
-                    DynamicPipeline::new(
-                        &device,
-                        &pipeline_layout,
-                        swapchain,
-                        &vert_shader,
-                        &frag_shader,
-                    )
-                    .map_err(InitializeStateError::PipelineCreation)
-                    .unwrap_or_else(|e| {
-                        tracing::error!("Could not recreate pipeline: Error {}", e);
-                        event_loop.exit();
-                        panic!("Exiting due to pipeline recreation failure");
-                    }),
-                )
-            });
-            // Recreate per-frame resources that were dropped on suspend.
-            const MAX_FRAMES_IN_FLIGHT: u32 = 3;
-            let mut frame_data = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT as usize);
-            for _ in 0..MAX_FRAMES_IN_FLIGHT {
-                match FrameData::new(&device) {
-                    Ok(fd) => frame_data.push(fd),
-                    Err(e) => {
-                        tracing::error!("Failed to recreate frame resources on resume: {}", e);
-                        return event_loop.exit();
-                    }
                 }
             }
-
-            self.app_state = Some(AppState::Running(RunningState {
-                pipeline_layout,
-                win,
-                instance,
-                surface,
-                device,
-                swapchain,
-                pipeline,
-                vert_shader,
-                frag_shader,
-                frame_data,
-                current_frame_index: current_frame,
-                shader_compiler_log_file,
-            }));
         }
 
         event_loop.set_control_flow(event_loop::ControlFlow::Poll);
     }
 
     fn suspended(&mut self, event_loop: &event_loop::ActiveEventLoop) {
-        if let Some(RunningState {
-            instance,
-            win,
-            surface: _,
-            device,
-            swapchain: _,
-            pipeline_layout,
-            pipeline: _,
-            vert_shader,
-            frag_shader,
-            frame_data: _frame_data,
-            current_frame_index: current_frame,
-            shader_compiler_log_file,
-        }) = self.take_running()
-        {
-            // Ensure the device is idle before we suspend; drop any GPU work first.
-            if let Err(e) = device.wait_idle() {
-                tracing::warn!("device.wait_idle() failed during suspend: {:?}", e);
-            }
+        if let Some(running_state) = self.take_running() {
+            // Convert to a suspended state; `into_suspended` will attempt to
+            // wait for the device to be idle and log any failures.
+            let suspended = running_state.into_suspended();
             event_loop.set_control_flow(event_loop::ControlFlow::Wait);
-            // `_frame_data` is intentionally dropped here; its Drop impl will
-            // wait on the per-frame fence to ensure GPU work completes.
-            self.app_state = Some(AppState::Suspended(SuspendedState {
-                win,
-                instance,
-                device,
-                pipeline_layout,
-                vert_shader,
-                frag_shader,
-                current_frame,
-                shader_compiler_log_file,
-            }))
+            self.app_state = Some(AppState::Suspended(suspended));
         }
 
         event_loop.set_control_flow(event_loop::ControlFlow::Wait);
@@ -602,137 +657,156 @@ impl ApplicationHandler for AppRunner {
         window_id: winit::window::WindowId,
         event: winit::event::WindowEvent,
     ) {
-        if let Some(RunningState { win, .. }) = self.as_running_mut() {
-            if win.id() == window_id {
-                match event {
-                    WindowEvent::CloseRequested if window_id == win.id() => {
-                        win.set_visible(false);
-                        // If we are currently running, ensure the device is idle before exiting.
-                        if let Some(running_state) = self.take_running() {
-                            if let Err(e) = running_state.device.wait_idle() {
-                                tracing::warn!("device.wait_idle() failed during exit: {:?}", e);
+        if let Some(RunningState { win, .. }) = self.as_running_mut()
+            && win.id() == window_id
+        {
+            match event {
+                WindowEvent::CloseRequested if window_id == win.id() => {
+                    win.set_visible(false);
+                    // If we are currently running, ensure the device is idle before exiting.
+                    if let Some(running_state) = self.take_running() {
+                        #[allow(
+                            clippy::collapsible_if,
+                            reason = "These are logically seperate steps, not a single check"
+                        )]
+                        if let Err(e) = running_state.device.wait_idle() {
+                            tracing::warn!("device.wait_idle() failed during exit: {:?}", e);
+                        }
+                    }
+                    self.app_state = Some(AppState::Exiting);
+                    event_loop.exit();
+                }
+                WindowEvent::Resized(new_size) => {
+                    let mut state = match self.take_running() {
+                        Some(s) => s,
+                        None => {
+                            tracing::error!(
+                                "state transition failed: expected Running state but it \
+                                    was not present"
+                            );
+                            return;
+                        }
+                    };
+                    assert!(state.win.inner_size() == new_size);
+                    let new_swapchain = if let Some(swapchain) = state.swapchain.as_ref() {
+                        match Swapchain::create(&state.device, &state.surface, Some(swapchain)) {
+                            Ok(s) => s.map(Arc::new),
+                            Err(e) => {
+                                tracing::error!(
+                                    "Error while creating swapchain due to resize {}",
+                                    e
+                                );
+                                return event_loop.exit();
                             }
                         }
-                        self.app_state = Some(AppState::Exiting);
-                        event_loop.exit();
-                    }
-                    WindowEvent::Resized(new_size) => {
-                        let state = match self.take_running() {
-                            Some(s) => s,
-                            None => {
+                    } else {
+                        let _ = state.device.wait_idle();
+                        for frame in &mut state.frame_data {
+                            frame.prev_frame_stash = None;
+                        }
+                        match Swapchain::create(&state.device, &state.surface, None) {
+                            Ok(s) => s.map(Arc::new),
+                            Err(e) => {
                                 tracing::error!(
-                                    "state transition failed: expected Running state but it \
-                                    was not present"
+                                    "Error while creating swapchain due to resize: {}",
+                                    e
                                 );
-                                return;
+                                return event_loop.exit();
                             }
-                        };
-                        assert!(state.win.inner_size() == new_size);
-                        let new_swapchain = if let Some(swapchain) = state.swapchain.as_ref() {
-                            match Swapchain::create(&state.device, &state.surface, Some(swapchain))
-                            {
-                                Ok(s) => s.map(Arc::new),
+                        }
+                    };
+                    let new_pipeline = if let Some(new_swapchain) = new_swapchain.as_ref() {
+                        Some(Arc::new(
+                            match DynamicPipeline::new(
+                                &state.device,
+                                &state.pipeline_layout,
+                                new_swapchain,
+                                &state.vert_shader,
+                                &state.frag_shader,
+                            ) {
+                                Ok(p) => p,
                                 Err(e) => {
                                     tracing::error!(
-                                        "Error while creating swapchain due to resize {}",
+                                        "Error while creating pipeline due to resize {}",
                                         e
                                     );
                                     return event_loop.exit();
                                 }
+                            },
+                        ))
+                    } else {
+                        None
+                    };
+
+                    self.app_state = Some(AppState::Running(RunningState {
+                        win: state.win,
+                        instance: state.instance,
+                        surface: state.surface,
+                        device: state.device,
+                        swapchain: new_swapchain,
+                        pipeline_layout: state.pipeline_layout,
+                        pipeline: new_pipeline,
+                        vert_shader: state.vert_shader,
+                        frag_shader: state.frag_shader,
+                        frame_data: state.frame_data,
+                        current_frame_index: state.current_frame_index,
+                        shader_compiler_log_file: state.shader_compiler_log_file,
+                    }));
+                }
+
+                WindowEvent::RedrawRequested => {
+                    if let Some(state) = self.as_running_mut() {
+                        match state.redraw() {
+                            Ok(DrawStatus { suboptimal }) => {
+                                if suboptimal {
+                                    tracing::warn!(
+                                        "Redraw completed but swapchain marked SUBOPTIMAL"
+                                    );
+                                }
+                                state.win.request_redraw();
                             }
-                        } else {
-                            None
-                        };
-                        let new_pipeline = if let Some(new_swapchain) = new_swapchain.as_ref() {
-                            Some(Arc::new(
-                                match DynamicPipeline::new(
-                                    &state.device,
-                                    &state.pipeline_layout,
-                                    new_swapchain,
-                                    &state.vert_shader,
-                                    &state.frag_shader,
-                                ) {
-                                    Ok(p) => p,
-                                    Err(e) => {
-                                        tracing::error!(
-                                            "Error while creating pipeline due to resize {}",
-                                            e
-                                        );
-                                        return event_loop.exit();
-                                    }
-                                },
-                            ))
-                        } else {
-                            None
-                        };
-
-                        self.app_state = Some(AppState::Running(RunningState {
-                            win: state.win,
-                            instance: state.instance,
-                            surface: state.surface,
-                            device: state.device,
-                            swapchain: new_swapchain,
-                            pipeline_layout: state.pipeline_layout,
-                            pipeline: new_pipeline,
-                            vert_shader: state.vert_shader,
-                            frag_shader: state.frag_shader,
-                            frame_data: state.frame_data,
-                            current_frame_index: state.current_frame_index,
-                            shader_compiler_log_file: state.shader_compiler_log_file,
-                        }));
-                    }
-
-                    WindowEvent::RedrawRequested => {
-                        if let Some(state) = self.as_running_mut() {
-                            match state.redraw() {
-                                Ok(DrawStatus { suboptimal }) => {
-                                    if suboptimal {
-                                        tracing::warn!(
-                                            "Redraw completed but swapchain marked SUBOPTIMAL"
-                                        );
-                                    }
-                                    state.win.request_redraw();
-                                }
-                                Err(e) => {
-                                    tracing::error!("Error during redraw: {}", e);
-                                    event_loop.exit();
-                                }
+                            Err(e) => {
+                                tracing::error!("Error during redraw: {}", e);
+                                event_loop.exit();
                             }
                         }
                     }
-
-                    _ => {}
                 }
+
+                _ => {}
             }
         }
     }
 }
 
+/// Result information from a successful `redraw` invocation.
+///
+/// `suboptimal` indicates whether the swapchain or presentation reported a
+/// SUBOPTIMAL condition (a hint that the swapchain should be recreated
+/// soon, though not strictly required for correctness).
 struct DrawStatus {
+    /// True if the swapchain or present operation was marked SUBOPTIMAL.
     suboptimal: bool,
 }
 
 impl RunningState {
-    /// Perform a redraw. Currently this is a best-effort scaffold:
-    /// - waits on per-frame `prev_frame_fence` with a one-second timeout
-    /// - resets the fence so it can be reused
-    ///
-    /// Future work: acquire swapchain image, record/submit command buffers
-    /// and present using the per-frame semaphores.
+    /// Redraw the current frame. Returns whether the swapchain is suboptimal
     pub fn redraw(&mut self) -> Result<DrawStatus, RedrawError> {
         if self.frame_data.is_empty() {
             //Should be an unecessary fallback path but just in case
             tracing::warn!("redraw called but no frame data is available");
             self.current_frame_index = 0;
             Err(RedrawError::NoFrameData)
-        } else if let Some(swapchain) = &self.swapchain {
+        } else if let Some(swapchain) = &self.swapchain
+            && let Some(pipeline) = &self.pipeline
+        {
             let current_frame_index = self.current_frame_index;
             let next_frame_index = (current_frame_index + 1) % self.frame_data.len();
             let frame = &mut self.frame_data[current_frame_index];
             self.current_frame_index = next_frame_index;
 
             frame.prev_frame_fence.wait_and_reset(u64::MAX)?;
-            frame.prev_frame_ptrs = None;
+            frame.prev_frame_stash = None;
 
             // Acquire the next image from the swapchain
             let (image_index, suboptimal) =
@@ -740,13 +814,13 @@ impl RunningState {
                 {
                     Ok((image_index, suboptimal)) => (image_index, suboptimal),
                     Err(rvk::swapchain::AcquireImageError::OutOfDate) => {
-                        return Err(RedrawError::OutOfDateSwapchain)
+                        return Err(RedrawError::OutOfDateSwapchain);
                     }
                     Err(rvk::swapchain::AcquireImageError::Timeout) => {
-                        return Err(RedrawError::UnknownVk(ash::vk::Result::TIMEOUT))
+                        return Err(RedrawError::UnknownVk(ash::vk::Result::TIMEOUT));
                     }
                     Err(rvk::swapchain::AcquireImageError::UnknownVulkan(e)) => {
-                        return Err(RedrawError::UnknownVk(e))
+                        return Err(RedrawError::UnknownVk(e));
                     }
                 };
 
@@ -770,10 +844,6 @@ impl RunningState {
                 0.0,
                 1.0,
             );
-            let pipeline = self
-                .pipeline
-                .as_ref()
-                .expect("pipeline must exist when swapchain exists");
             renderer.bind_pipeline(pipeline);
             renderer.draw(3, 1, 0, 0);
             drop(renderer);
@@ -791,7 +861,7 @@ impl RunningState {
                 &[&frame.render_complete_semaphore],
                 Some(&frame.prev_frame_fence),
             )?;
-            frame.prev_frame_ptrs = Some((swapchain.clone(), cb_recorded));
+            frame.prev_frame_stash = Some((swapchain.clone(), cb_recorded, pipeline.clone()));
 
             // Present the rendered image. Treat PRESENT_OUT_OF_DATE as a
             // request to recreate the swapchain.
@@ -812,20 +882,29 @@ impl RunningState {
             Ok(DrawStatus { suboptimal: false })
         }
     }
+
+    /// Convert this `RunningState` into a `SuspendedState`, attempting to
+    /// wait for the device to become idle first. Any failures while waiting
+    /// are logged but do not prevent the transition.
+    fn into_suspended(self) -> SuspendedState {
+        if let Err(e) = self.device.wait_idle() {
+            tracing::warn!("device.wait_idle() failed during suspend: {:?}", e);
+        }
+        SuspendedState {
+            win: self.win,
+            instance: self.instance,
+            device: self.device,
+            pipeline_layout: self.pipeline_layout,
+            vert_shader: self.vert_shader,
+            frag_shader: self.frag_shader,
+            current_frame: self.current_frame_index,
+            shader_compiler_log_file: self.shader_compiler_log_file,
+        }
+    }
 }
 
-#[derive(clap::Parser, Debug)]
-/// Argument parser from clap
-struct Args {
-    //TODO: Configure default to change based on build personality (e.g. release
-    //vs internal opt vs debug)
-    #[arg(short, long, default_value_t = VulkanDebugLevel::Warn)]
-    /// What level to run validation layers at
-    vulkan_debug_level: VulkanDebugLevel,
-    #[arg(short, long, default_value_t=tracing::Level::WARN)]
-    /// What level to run Rust's logging at
-    log_level: tracing::Level,
-}
+// `Args` moved into the library crate (`src/lib.rs`) and re-exported as
+// `rps_studio::Args` so tests and the binary can share the definition.
 
 fn main() -> eyre::Result<()> {
     let args = Args::parse();

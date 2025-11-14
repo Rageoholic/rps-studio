@@ -6,8 +6,8 @@ use std::{
 use ash::vk::{self, Handle};
 use thiserror::Error;
 
-use crate::rvk::device::Device;
 use crate::LockResultExt;
+use crate::rvk::device::Device;
 // no direct sync object imports here; submission moved to Device
 
 /// Level of command buffer to allocate (maps to Vulkan's CommandBufferLevel)

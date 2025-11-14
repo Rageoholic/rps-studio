@@ -6,12 +6,25 @@
     "configurations": [
         {
             "type": "cppvsdbg",
-            "name": "Launch",
+            "name": "Launch rps-studio",
             "preLaunchTask": "rust: cargo build",
             "program": "${workspaceRoot}/target/debug/rps-studio.exe",
             "request": "launch",
             "console": "integratedTerminal",
             "cwd": "${workspaceRoot}"
+        },
+        {
+            "type": "cppvsdbg",
+            "name": "Launch rps-studio (with TRACE log level)",
+            "preLaunchTask": "rust: cargo build",
+            "program": "${workspaceRoot}/target/debug/rps-studio.exe",
+            "request": "launch",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceRoot}",
+            "args": [
+                "--log-level",
+                "TRACE"
+            ]
         },
         {
             "type": "lldb",

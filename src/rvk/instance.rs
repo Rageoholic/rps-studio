@@ -1,10 +1,10 @@
 // Reconstructed instance module: provides Instance and debug utilities
 use ash::{
+    Entry,
     vk::{
         self, DebugUtilsMessageSeverityFlagsEXT, DebugUtilsMessageTypeFlagsEXT,
         DebugUtilsMessengerEXT,
     },
-    Entry,
 };
 use debug_messenger::instance_debug_callback;
 use std::{ffi::CStr, fmt::Debug};
