@@ -149,7 +149,7 @@ struct FrameData {
     render_complete_semaphore: rvk::sync_objects::Semaphore,
     /// place to stash previous frame's resources because they can't be
     /// destroyed according to vulkan until command buffer execution is complete
-    prev_frame_stash: Option<(Arc<Swapchain>, RecordedCommandBuffer, Arc<DynamicPipeline>)>,
+    in_flight_resources: Option<(Arc<Swapchain>, RecordedCommandBuffer, Arc<DynamicPipeline>)>,
 }
 
 impl Drop for FrameData {
@@ -457,7 +457,7 @@ impl FrameData {
             prev_frame_fence,
             acquired_image_semaphore,
             render_complete_semaphore,
-            prev_frame_stash: None,
+            in_flight_resources: None,
         })
     }
 }
@@ -667,7 +667,7 @@ impl ApplicationHandler for AppRunner {
                     if let Some(running_state) = self.take_running() {
                         #[allow(
                             clippy::collapsible_if,
-                            reason = "These are logically seperate steps, not a single check"
+                            reason = "These are logically separate steps, not a single check"
                         )]
                         if let Err(e) = running_state.device.wait_idle() {
                             tracing::warn!("device.wait_idle() failed during exit: {:?}", e);
@@ -702,7 +702,7 @@ impl ApplicationHandler for AppRunner {
                     } else {
                         let _ = state.device.wait_idle();
                         for frame in &mut state.frame_data {
-                            frame.prev_frame_stash = None;
+                            frame.in_flight_resources = None;
                         }
                         match Swapchain::create(&state.device, &state.surface, None) {
                             Ok(s) => s.map(Arc::new),
@@ -763,13 +763,13 @@ impl ApplicationHandler for AppRunner {
                                         "Redraw completed but swapchain marked SUBOPTIMAL"
                                     );
                                 }
-                                state.win.request_redraw();
                             }
                             Err(e) => {
                                 tracing::error!("Error during redraw: {}", e);
                                 event_loop.exit();
                             }
                         }
+                        state.win.request_redraw();
                     }
                 }
 
@@ -806,7 +806,7 @@ impl RunningState {
             self.current_frame_index = next_frame_index;
 
             frame.prev_frame_fence.wait_and_reset(u64::MAX)?;
-            frame.prev_frame_stash = None;
+            frame.in_flight_resources = None;
 
             // Acquire the next image from the swapchain
             let (image_index, suboptimal) =
@@ -861,7 +861,7 @@ impl RunningState {
                 &[&frame.render_complete_semaphore],
                 Some(&frame.prev_frame_fence),
             )?;
-            frame.prev_frame_stash = Some((swapchain.clone(), cb_recorded, pipeline.clone()));
+            frame.in_flight_resources = Some((swapchain.clone(), cb_recorded, pipeline.clone()));
 
             // Present the rendered image. Treat PRESENT_OUT_OF_DATE as a
             // request to recreate the swapchain.
